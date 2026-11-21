@@ -475,6 +475,40 @@ Semantics follow the [log-based metrics overview](https://docs.cloud.google.com/
 [labels](https://docs.cloud.google.com/logging/docs/logs-based-metrics/labels) and
 [distribution metrics](https://docs.cloud.google.com/logging/docs/logs-based-metrics/distribution-metrics).
 
+## Cloud Audit Logs
+
+floci-gcp writes Admin Activity audit entries, the log Google describes as "always written; you can't
+configure, exclude, or disable them" ([Cloud Audit Logs](https://docs.cloud.google.com/logging/docs/audit)),
+to `{parent}/logs/cloudaudit.googleapis.com%2Factivity`, in both IAM authorization modes. Each entry is
+an `AuditLog` `protoPayload` (see [Entry semantics](#entry-semantics)), so it is listed, routed by sinks
+and counted by log-based metrics like any other entry.
+
+| Service | Methods (`protoPayload.methodName`) | `resource.type` |
+|---|---|---|
+| IAM (`iam.googleapis.com`) | `google.iam.admin.v1.` `CreateServiceAccount`, `PatchServiceAccount`, `UpdateServiceAccount`, `DeleteServiceAccount`, `DisableServiceAccount`, `EnableServiceAccount`, `CreateServiceAccountKey`, `DeleteServiceAccountKey`, `SetIAMPolicy` | `service_account` (`email_id`, `project_id`, `unique_id`) |
+| Resource Manager (`cloudresourcemanager.googleapis.com`) | `SetIamPolicy` on a project, over REST and the IAM policy gRPC mixin | `project` (`project_id`) |
+| Cloud Logging (`logging.googleapis.com`) | `google.logging.v2.ConfigServiceV2.` `CreateSink`, `UpdateSink`, `DeleteSink` for project sinks, over REST and gRPC | `logging_sink` (`project_id`, `destination` empty, `name`) |
+
+Each entry carries `serviceName`, `methodName`, `resourceName`, `status` (`{}` on success, the call's
+code and message otherwise), `authenticationInfo` (`principalEmail` and `principalSubject` of a
+Floci-issued service-account token; empty for anonymous and external credentials), one
+`authorizationInfo` per permission the call needs (`granted` is false, and so left out of proto3 JSON,
+when IAM refused the call), `requestMetadata` (`callerIp`, `callerSuppliedUserAgent`,
+`requestAttributes.time`), and the RPC `request` with its `@type`. SetIamPolicy entries add
+`serviceData` (`google.iam.v1.logging.AuditData` with the `policyDelta` of added and removed grants) and
+the resulting policy as `response`. Severity is `NOTICE` on success and `ERROR` on failure. A call that
+IAM refuses in `enforce` mode is recorded with `PERMISSION_DENIED`.
+
+Method names and their log type follow the [IAM](https://docs.cloud.google.com/iam/docs/audit-logging),
+[Resource Manager](https://docs.cloud.google.com/resource-manager/docs/audit-logging) and
+[Cloud Logging](https://docs.cloud.google.com/logging/docs/audit-logging) audit logging pages; field
+shapes follow `google/cloud/audit/audit_log.proto` and entries captured from Google Cloud.
+
+Deviations: `insertId` is a UUID; `response` is only written for SetIamPolicy; IAM requests carry the
+request's name and, for CreateServiceAccount, its account fields, not every field; `requestAttributes`
+always has `time`; entries are written synchronously; `principalEmail` is never redacted. Data Access,
+System Event and Policy Denied logs, and Admin Activity entries of other services, are not written.
+
 ## Not Yet Supported
 
 `TailLogEntries` (streaming), `protoPayload` types other than AuditLog, `httpRequest`/`sourceLocation`/`split`

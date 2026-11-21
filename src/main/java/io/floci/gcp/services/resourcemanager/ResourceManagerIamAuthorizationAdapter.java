@@ -5,6 +5,8 @@ import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.IamBinding;
 import io.floci.gcp.services.iam.IamPolicy;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
@@ -51,6 +53,24 @@ public class ResourceManagerIamAuthorizationAdapter implements IamAuthorizationA
     @Override
     public IamOperation grpcOperation(String method, JsonNode request) {
         throw unsupported("gRPC operation " + method);
+    }
+
+    /**
+     * SetIamPolicy on a project, over REST and the shared IAM policy gRPC mixin, as real entries record it:
+     * method {@code SetIamPolicy}, a {@code project} resource, and the request's bare project ID.
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (!"SetIamPolicy".equals(operation.name()) || !operation.resource().matches("projects/[^/]+")) {
+            return Optional.empty();
+        }
+        String project = operation.resource().substring("projects/".length());
+        Map<String, Object> audited = AuditedMethod.request("google.iam.v1.SetIamPolicyRequest", null);
+        audited.put("resource", project);
+        audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+        return Optional.of(new AuditedMethod("cloudresourcemanager.googleapis.com", "SetIamPolicy",
+                operation.resource(), operation.resource(), "project", Map.of("project_id", project), audited,
+                operation.resource()));
     }
 
     @Override

@@ -10,6 +10,7 @@ import io.floci.gcp.core.common.ServiceRegistry;
 import io.floci.gcp.core.common.ServiceUsageAdapter;
 import io.floci.gcp.core.common.ServiceUsageGate;
 import io.floci.gcp.core.common.ServiceUsageGrpcInterceptor;
+import io.floci.gcp.services.cloudlogging.AuditGrpcInterceptor;
 import io.floci.gcp.services.iam.authorization.IamGrpcAuthorizationInterceptor;
 import io.grpc.BindableService;
 import io.grpc.Context;
@@ -43,6 +44,7 @@ public class GrpcServerManager {
     private final Router router;
     private final Instance<BindableService> services;
     private final IamGrpcAuthorizationInterceptor authorization;
+    private final AuditGrpcInterceptor audit;
     private final ServiceRegistry serviceRegistry;
     private final ServiceUsageGate serviceUsageGate;
     private final ProjectRegistry projectRegistry;
@@ -52,12 +54,13 @@ public class GrpcServerManager {
 
     @Inject
     GrpcServerManager(Vertx vertx, Router router, Instance<BindableService> services,
-            IamGrpcAuthorizationInterceptor authorization, ServiceRegistry serviceRegistry,
+            IamGrpcAuthorizationInterceptor authorization, AuditGrpcInterceptor audit, ServiceRegistry serviceRegistry,
             ServiceUsageGate serviceUsageGate, ProjectRegistry projectRegistry, EmulatorConfig config) {
         this.vertx = vertx;
         this.router = router;
         this.services = services;
         this.authorization = authorization;
+        this.audit = audit;
         this.serviceRegistry = serviceRegistry;
         this.serviceUsageGate = serviceUsageGate;
         this.projectRegistry = projectRegistry;
@@ -119,8 +122,9 @@ public class GrpcServerManager {
                 new ProjectContextGrpcInterceptor(defaultProjectId, projectRegistry,
                         api.map(ServiceDescriptor::requestDomains).orElse(Set.of())));
         ProtoResourceFields.register(scoped);
+        // Audit wraps IAM, so a call IAM refuses is recorded with its status.
         ServerServiceDefinition authorized = ServerInterceptors.intercept(
-                ServerInterceptors.intercept(scoped, interceptors), authorization);
+                ServerInterceptors.intercept(scoped, interceptors), authorization, audit);
         // The interceptor applied last runs first, so a disabled API answers SERVICE_DISABLED before IAM runs.
         ServerServiceDefinition gated = api
                 .filter(serviceUsageGate::gates)

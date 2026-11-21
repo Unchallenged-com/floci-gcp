@@ -48,6 +48,15 @@ public interface IamAuthorizationAdapter {
 
     Map<String, Set<String>> roles();
 
+    /**
+     * The Admin Activity audit entry this operation writes, or empty when the service does not audit it.
+     * Called before the call runs and again after it, so a resource created or deleted by the call is
+     * described from whichever side it exists on.
+     */
+    default Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        return Optional.empty();
+    }
+
     /** Builds the service's permission-denied response for a failed check. */
     default GcpException permissionDenied(IamPermissionCheck check) {
         return GcpException.permissionDenied("Permission " + check.permission()

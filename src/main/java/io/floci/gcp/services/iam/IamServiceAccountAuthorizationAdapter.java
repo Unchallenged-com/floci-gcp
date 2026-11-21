@@ -2,14 +2,18 @@ package io.floci.gcp.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.gcp.core.common.GcpException;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.floci.gcp.services.iamcredentials.IamCredentialsController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
+import io.floci.gcp.services.iam.model.StoredServiceAccount;
 import jakarta.inject.Inject;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -192,6 +196,76 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
                 || "iam.serviceAccounts.list".equals(permission)
                         ? IamResource.project(operation.resource()) : requireResource(operation.resource());
         return List.of(new IamPermissionCheck(permission, resource));
+    }
+
+    /**
+     * The Admin Activity methods of https://docs.cloud.google.com/iam/docs/audit-logging for the
+     * operations this adapter maps. {@code resource} is a {@code service_account} with the account's
+     * {@code email_id}, {@code project_id} and {@code unique_id}, and CreateServiceAccount names its
+     * project, as real entries do.
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        String method = switch (operation.name()) {
+            case "CreateServiceAccount", "DeleteServiceAccount", "DisableServiceAccount", "EnableServiceAccount",
+                    "CreateServiceAccountKey", "DeleteServiceAccountKey" -> operation.name();
+            case "UpdateServiceAccount" -> "PATCH".equalsIgnoreCase(request.transportMethod())
+                    ? "PatchServiceAccount" : "UpdateServiceAccount";
+            case "SetIamPolicy" -> "SetIAMPolicy";
+            default -> null;
+        };
+        if (method == null) {
+            return Optional.empty();
+        }
+        String methodName = "google.iam.admin.v1." + method;
+        if ("CreateServiceAccount".equals(method)) {
+            String project = operation.resource().substring("projects/".length());
+            String email = request.body().path("accountId").asText("") + "@" + project + ".iam.gserviceaccount.com";
+            Map<String, Object> created = AuditedMethod.request("google.iam.admin.v1.CreateServiceAccountRequest", null);
+            created.put("name", operation.resource());
+            created.put("account_id", request.body().path("accountId").asText(""));
+            Map<String, Object> account = new LinkedHashMap<>();
+            putText(account, "display_name", request.body().path("serviceAccount").path("displayName"));
+            putText(account, "description", request.body().path("serviceAccount").path("description"));
+            created.put("service_account", account);
+            return Optional.of(new AuditedMethod(SERVICE, methodName, operation.resource(), operation.resource(),
+                    "service_account", accountLabels(project, email), created, null));
+        }
+        String name = operation.resource();
+        int keyMarker = name.indexOf("/keys/");
+        String accountName = keyMarker >= 0 ? name.substring(0, keyMarker) : name;
+        String[] parts = accountName.split("/", 4);
+        String project = parts[1];
+        String email = parts[3];
+        Map<String, String> labels = accountLabels(project, email);
+        String accountId = labels.getOrDefault("unique_id", "").isEmpty() ? email : labels.get("unique_id");
+        String resourceName = "projects/-/serviceAccounts/" + accountId + (keyMarker >= 0 ? name.substring(keyMarker) : "");
+        Map<String, Object> audited;
+        if ("SetIAMPolicy".equals(method)) {
+            audited = AuditedMethod.request("google.iam.v1.SetIamPolicyRequest", null);
+            audited.put("resource", accountName);
+            audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+        } else {
+            audited = AuditedMethod.request("google.iam.admin.v1." + method + "Request", null);
+            audited.put("name", name);
+        }
+        return Optional.of(new AuditedMethod(SERVICE, methodName, resourceName, "projects/" + project,
+                "service_account", labels, audited, "SetIAMPolicy".equals(method) ? accountName : null));
+    }
+
+    private Map<String, String> accountLabels(String project, String email) {
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("email_id", email);
+        labels.put("project_id", project);
+        labels.put("unique_id", iamService.get().findServiceAccount(email).map(StoredServiceAccount::getUniqueId)
+                .orElse(""));
+        return labels;
+    }
+
+    private static void putText(Map<String, Object> target, String key, JsonNode value) {
+        if (value.isTextual()) {
+            target.put(key, value.asText());
+        }
     }
 
     @Override

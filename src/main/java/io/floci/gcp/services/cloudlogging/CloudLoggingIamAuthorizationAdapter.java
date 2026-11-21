@@ -14,11 +14,14 @@ import com.google.logging.v2.UpdateSinkRequest;
 import com.google.protobuf.Message;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -81,6 +84,46 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     @Override
     public IamOperation grpcOperation(String method, JsonNode request) {
         throw unsupported("gRPC JSON operation " + method);
+    }
+
+    /**
+     * Sink creation, update and deletion in a project, as real entries record them: a {@code logging_sink}
+     * resource with an empty {@code destination} label, and the RPC request.
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (!Set.of("CreateSink", "UpdateSink", "DeleteSink").contains(operation.name())
+                || !operation.resource().matches("projects/[^/]+/sinks/[^/]+")) {
+            return Optional.empty();
+        }
+        String[] parts = operation.resource().split("/");
+        String parent = "projects/" + parts[1];
+        Map<String, Object> audited;
+        if (request.grpc()) {
+            audited = AuditedMethod.request("google.logging.v2." + operation.name() + "Request", request.body());
+        } else {
+            audited = AuditedMethod.request("google.logging.v2." + operation.name() + "Request", null);
+            if ("CreateSink".equals(operation.name())) {
+                audited.put("parent", parent);
+            } else {
+                audited.put("sinkName", operation.resource());
+            }
+            if (!"DeleteSink".equals(operation.name())) {
+                audited.put("sink", AuditedMethod.value(request.body()));
+                if (request.query().get("updateMask") != null) {
+                    audited.put("updateMask", request.query().get("updateMask"));
+                }
+                if ("true".equals(request.query().get("uniqueWriterIdentity"))) {
+                    audited.put("uniqueWriterIdentity", true);
+                }
+            }
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("project_id", parts[1]);
+        labels.put("destination", "");
+        labels.put("name", parts[3]);
+        return Optional.of(new AuditedMethod("logging.googleapis.com", "google.logging.v2.ConfigServiceV2."
+                + operation.name(), operation.resource(), parent, "logging_sink", labels, audited, null));
     }
 
     @Override

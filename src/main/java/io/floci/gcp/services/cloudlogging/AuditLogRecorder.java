@@ -1,0 +1,275 @@
+package io.floci.gcp.services.cloudlogging;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.cloud.audit.AuditLog;
+import com.google.cloud.audit.AuthenticationInfo;
+import com.google.cloud.audit.AuthorizationInfo;
+import com.google.cloud.audit.RequestMetadata;
+import com.google.iam.v1.BindingDelta;
+import com.google.iam.v1.PolicyDelta;
+import com.google.iam.v1.logging.AuditData;
+import com.google.protobuf.Any;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Timestamp;
+import com.google.rpc.Code;
+import com.google.rpc.Status;
+import com.google.rpc.context.AttributeContext;
+import com.google.type.Expr;
+import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
+import io.floci.gcp.services.iam.IamPrincipal;
+import io.floci.gcp.services.iam.IamPrincipalResolver;
+import io.floci.gcp.services.iam.IamService;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
+import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
+import io.floci.gcp.services.iam.authorization.IamOperation;
+import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
+import io.floci.gcp.services.iam.model.StoredPolicy;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Writes Cloud Audit Logs Admin Activity entries for the calls the IAM authorization adapters
+ * describe with {@link IamAuthorizationAdapter#auditedMethod}. Transports call {@link #begin} before
+ * the call runs and {@link #complete} with its outcome; both IAM authorization modes are audited, as
+ * Admin Activity logs are "always written".
+ *
+ * <p>Sources: https://docs.cloud.google.com/logging/docs/audit (log names, caller identity and IP),
+ * {@code google/cloud/audit/audit_log.proto}, and each service's audit logging page for its methods.
+ */
+@ApplicationScoped
+public class AuditLogRecorder {
+
+    static final String ACTIVITY_LOG_ID = "cloudaudit.googleapis.com%2Factivity";
+
+    private static final Logger LOG = Logger.getLogger(AuditLogRecorder.class);
+    private static final String SERVICE_ACCOUNT_MEMBER = "serviceAccount:";
+
+    private final Instance<CloudLoggingService> logging;
+    private final Instance<IamService> iam;
+    private final IamPrincipalResolver principals;
+    private final ObjectMapper json;
+
+    @Inject
+    public AuditLogRecorder(Instance<CloudLoggingService> logging, Instance<IamService> iam,
+            IamPrincipalResolver principals, ObjectMapper json) {
+        this.logging = logging;
+        this.iam = iam;
+        this.principals = principals;
+        this.json = json;
+    }
+
+    /** What is known of an audited call before it runs. */
+    public record Call(IamAuthorizationAdapter adapter, IamOperation operation, AuditRequest request,
+            AuditedMethod method, List<IamPermissionCheck> checks, IamPrincipal principal, String callerIp,
+            String userAgent, Instant time, StoredPolicy policyBefore) {
+    }
+
+    /** The call's audit context, or empty when the call is not audited. Never fails the call. */
+    public Optional<Call> begin(IamAuthorizationAdapter adapter, IamOperation operation, AuditRequest request,
+            String authorization, String callerIp, String userAgent) {
+        Instant time = Instant.now();
+        try {
+            Optional<AuditedMethod> method = adapter.auditedMethod(operation, request);
+            if (method.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(new Call(adapter, operation, request, method.get(), checks(adapter, operation),
+                    principal(authorization), callerIp, userAgent, time, policy(method.get().policyResource())));
+        } catch (RuntimeException e) {
+            LOG.debugf(e, "No audit entry for %s on %s", operation.name(), operation.resource());
+            return Optional.empty();
+        }
+    }
+
+    /** Writes the call's entry; {@code code} is the call's {@code google.rpc.Code}. Never fails the call. */
+    public void complete(Call call, int code, String message) {
+        try {
+            logging.get().writeLogEntries(null, null, null, null, List.of(entry(call, code, message)), false);
+        } catch (RuntimeException e) {
+            LOG.warnf(e, "Failed to write the audit entry for %s on %s",
+                    call.method().methodName(), call.method().resourceName());
+        }
+    }
+
+    private StoredLogEntry entry(Call call, int code, String message) {
+        AuditedMethod method = call.method();
+        Map<String, String> labels = new LinkedHashMap<>(method.resourceLabels());
+        after(call).ifPresent(completed -> completed.resourceLabels().forEach((key, value) -> {
+            if (value != null && !value.isEmpty()) {
+                labels.put(key, value);
+            }
+        }));
+
+        AuditLog.Builder audit = AuditLog.newBuilder()
+                .setServiceName(method.serviceName())
+                .setMethodName(method.methodName())
+                .setResourceName(method.resourceName())
+                .setStatus(code == Code.OK_VALUE ? Status.getDefaultInstance()
+                        : Status.newBuilder().setCode(code).setMessage(message == null ? "" : message).build())
+                .setAuthenticationInfo(authentication(call.principal()))
+                .setRequestMetadata(RequestMetadata.newBuilder()
+                        .setCallerIp(call.callerIp() == null ? "" : call.callerIp())
+                        .setCallerSuppliedUserAgent(call.userAgent() == null ? "" : call.userAgent())
+                        .setRequestAttributes(AttributeContext.Request.newBuilder()
+                                .setTime(timestamp(call.time()))
+                                .setAuth(AttributeContext.Auth.getDefaultInstance()))
+                        .setDestinationAttributes(AttributeContext.Peer.getDefaultInstance()));
+        // Real entries name the checked resource as resourceName does, e.g. projects/-/serviceAccounts/{uniqueId}.
+        for (IamPermissionCheck check : call.checks()) {
+            audit.addAuthorizationInfo(AuthorizationInfo.newBuilder()
+                    .setResource(method.resourceName())
+                    .setPermission(check.permission())
+                    .setGranted(code != Code.PERMISSION_DENIED_VALUE)
+                    .setResourceAttributes(AttributeContext.Resource.newBuilder()
+                            .setService(check.resource().service())
+                            .setName(method.resourceName())
+                            .setType(check.resource().type()))
+                    .setPermissionType(AuthorizationInfo.PermissionType.ADMIN_WRITE));
+        }
+        if (method.request() != null) {
+            audit.setRequest(Structs.toStruct(method.request()));
+        }
+        if (code == Code.OK_VALUE && call.policyBefore() != null) {
+            StoredPolicy policyAfter = policy(method.policyResource());
+            if (policyAfter != null) {
+                audit.setServiceData(Any.pack(AuditData.newBuilder()
+                        .setPolicyDelta(policyDelta(call.policyBefore(), policyAfter)).build()));
+                audit.setResponse(policyResponse(policyAfter));
+            }
+        }
+
+        StoredLogEntry entry = new StoredLogEntry();
+        entry.setLogName(method.logParent() + "/logs/" + ACTIVITY_LOG_ID);
+        entry.setResourceType(method.resourceType());
+        entry.setResourceLabels(labels);
+        entry.setSeverity(code == Code.OK_VALUE ? "NOTICE" : "ERROR");
+        entry.setTimestamp(call.time().toString());
+        entry.setProtoPayload(ProtoPayloads.fromAny(Any.pack(audit.build())));
+        return entry;
+    }
+
+    private static Optional<AuditedMethod> after(Call call) {
+        try {
+            return call.adapter().auditedMethod(call.operation(), call.request());
+        } catch (RuntimeException e) {
+            // A call that deleted its resource is described from before it ran.
+            return Optional.empty();
+        }
+    }
+
+    private static List<IamPermissionCheck> checks(IamAuthorizationAdapter adapter, IamOperation operation) {
+        try {
+            return adapter.checks(operation);
+        } catch (RuntimeException e) {
+            LOG.debugf(e, "No permission mapping for the audit entry of %s", operation.name());
+            return List.of();
+        }
+    }
+
+    private IamPrincipal principal(String authorization) {
+        try {
+            return principals.resolve(authorization).principal();
+        } catch (RuntimeException e) {
+            // A refused credential (a disabled account) fails the call itself; the entry has no principal.
+            return IamPrincipal.anonymous();
+        }
+    }
+
+    private StoredPolicy policy(String resource) {
+        if (resource == null) {
+            return null;
+        }
+        try {
+            return iam.get().getPolicy(resource);
+        } catch (RuntimeException e) {
+            LOG.debugf(e, "No IAM policy for the audit entry of %s", resource);
+            return null;
+        }
+    }
+
+    private static AuthenticationInfo authentication(IamPrincipal principal) {
+        AuthenticationInfo.Builder builder = AuthenticationInfo.newBuilder();
+        if (principal.isAuthenticated()) {
+            String member = principal.member();
+            if (member.startsWith(SERVICE_ACCOUNT_MEMBER)) {
+                builder.setPrincipalEmail(member.substring(SERVICE_ACCOUNT_MEMBER.length()));
+            }
+            builder.setPrincipalSubject(member);
+        }
+        return builder.build();
+    }
+
+    static PolicyDelta policyDelta(StoredPolicy before, StoredPolicy after) {
+        Set<Grant> old = grants(before);
+        Set<Grant> current = grants(after);
+        PolicyDelta.Builder delta = PolicyDelta.newBuilder();
+        for (Grant grant : current) {
+            if (!old.contains(grant)) {
+                delta.addBindingDeltas(grant.delta(BindingDelta.Action.ADD));
+            }
+        }
+        for (Grant grant : old) {
+            if (!current.contains(grant)) {
+                delta.addBindingDeltas(grant.delta(BindingDelta.Action.REMOVE));
+            }
+        }
+        return delta.build();
+    }
+
+    private Struct policyResponse(StoredPolicy policy) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("@type", "type.googleapis.com/google.iam.v1.Policy");
+        response.putAll(json.convertValue(policy, new TypeReference<Map<String, Object>>() {}));
+        return Structs.toStruct(response);
+    }
+
+    private static Set<Grant> grants(StoredPolicy policy) {
+        Set<Grant> grants = new LinkedHashSet<>();
+        if (policy.getBindings() == null) {
+            return grants;
+        }
+        for (Map<String, Object> binding : policy.getBindings()) {
+            if (!(binding.get("role") instanceof String role) || !(binding.get("members") instanceof List<?> members)) {
+                continue;
+            }
+            Map<?, ?> condition = binding.get("condition") instanceof Map<?, ?> map ? map : null;
+            for (Object member : members) {
+                grants.add(new Grant(role, String.valueOf(member), condition));
+            }
+        }
+        return grants;
+    }
+
+    private record Grant(String role, String member, Map<?, ?> condition) {
+        BindingDelta delta(BindingDelta.Action action) {
+            BindingDelta.Builder delta = BindingDelta.newBuilder().setAction(action).setRole(role).setMember(member);
+            if (condition != null) {
+                delta.setCondition(Expr.newBuilder()
+                        .setExpression(text(condition.get("expression")))
+                        .setTitle(text(condition.get("title")))
+                        .setDescription(text(condition.get("description"))));
+            }
+            return delta.build();
+        }
+
+        private static String text(Object value) {
+            return value == null ? "" : String.valueOf(value);
+        }
+    }
+
+    private static Timestamp timestamp(Instant instant) {
+        return Timestamp.newBuilder().setSeconds(instant.getEpochSecond()).setNanos(instant.getNano()).build();
+    }
+}
