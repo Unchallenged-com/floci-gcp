@@ -31,6 +31,8 @@ import java.util.stream.Collectors;
 public class CloudLoggingService {
 
     private static final Logger LOG = Logger.getLogger(CloudLoggingService.class);
+    /** entries.list pageSize: "Default is 50. If the value is negative, the request is rejected." */
+    private static final int DEFAULT_PAGE_SIZE = 50;
 
     private final StorageBackend<String, StoredLogEntry> entryStore;
     private final AtomicLong sequence = new AtomicLong(0);
@@ -140,11 +142,16 @@ public class CloudLoggingService {
         if (resourceNames == null || resourceNames.isEmpty()) {
             throw GcpException.invalidArgument("ListLogEntries requires at least one resource name");
         }
+        if (pageSize < 0) {
+            throw GcpException.invalidArgument("pageSize must not be negative");
+        }
         Predicate<StoredLogEntry> filterPredicate = LogEntryFilter.parse(filter);
         List<String> prefixes = resourceNames.stream().map(r -> r + "/logs/").collect(Collectors.toList());
 
+        // "Entries with equal timestamps are returned in order of their insertId values."
         Comparator<StoredLogEntry> comparator = Comparator
                 .comparing(CloudLoggingService::entryInstant)
+                .thenComparing(StoredLogEntry::getInsertId, Comparator.nullsFirst(Comparator.naturalOrder()))
                 .thenComparingLong(StoredLogEntry::getSequence);
         if (orderBy != null && orderBy.toLowerCase().contains("desc")) {
             comparator = comparator.reversed();
@@ -156,7 +163,7 @@ public class CloudLoggingService {
                 .sorted(comparator)
                 .collect(Collectors.toList());
 
-        return PageToken.paginate(matched, pageSize, pageToken);
+        return PageToken.paginate(matched, pageSize == 0 ? DEFAULT_PAGE_SIZE : pageSize, pageToken);
     }
 
     public List<String> listLogs(String parent) {

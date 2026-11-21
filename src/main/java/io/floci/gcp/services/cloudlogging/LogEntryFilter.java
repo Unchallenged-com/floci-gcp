@@ -1,133 +1,378 @@
 package io.floci.gcp.services.cloudlogging;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.ibm.icu.text.Normalizer2;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
-import org.jboss.logging.Logger;
 
+import java.math.BigDecimal;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.function.Function;
 import java.util.function.Predicate;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
- * Parses a practical subset of the Cloud Logging filter language into a predicate over
- * {@link StoredLogEntry}. Supports AND-combined comparisons on:
- * {@code logName =}, {@code severity <op>}, {@code resource.type =}, {@code timestamp <op>},
- * and {@code labels.<key> =}. An empty filter matches everything. Unrecognized clauses are
- * treated leniently (match-all) and logged at debug. OR/NOT/functions/regex are not supported.
+ * The subset of the Logging query language that sinks, exclusions, log-based metrics and ListLogEntries
+ * evaluate. Unsupported syntax is rejected rather than ignored: it stops a sink's delivery (exclusions
+ * included) and fails ListLogEntries with INVALID_ARGUMENT, so no query silently matches everything.
  */
 final class LogEntryFilter {
+    private static final Normalizer2 STRING_NORMALIZER = Normalizer2.getNFKCCasefoldInstance();
+    private static final JsonMapper JSON = JsonMapper.builder()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
+    private static final List<String> SEVERITIES = List.of(
+            "DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY");
 
-    private static final Logger LOG = Logger.getLogger(LogEntryFilter.class);
+    private final List<String> tokens;
+    private int position;
 
-    private static final Pattern CLAUSE =
-            Pattern.compile("^(\\S+?)\\s*(>=|<=|=|>|<)\\s*(.+)$");
-
-    private static final Map<String, Integer> SEVERITY_RANK = Map.ofEntries(
-            Map.entry("DEFAULT", 0), Map.entry("DEBUG", 100), Map.entry("INFO", 200),
-            Map.entry("NOTICE", 300), Map.entry("WARNING", 400), Map.entry("ERROR", 500),
-            Map.entry("CRITICAL", 600), Map.entry("ALERT", 700), Map.entry("EMERGENCY", 800));
-
-    private LogEntryFilter() {}
+    private LogEntryFilter(String filter) {
+        tokens = tokenize(filter);
+    }
 
     static Predicate<StoredLogEntry> parse(String filter) {
         if (filter == null || filter.isBlank()) {
             return entry -> true;
         }
-        Predicate<StoredLogEntry> predicate = entry -> true;
-        for (String clause : filter.split("(?i)\\s+AND\\s+")) {
-            String trimmed = clause.trim();
-            if (trimmed.isEmpty()) {
+        LogEntryFilter parser = new LogEntryFilter(filter);
+        Predicate<StoredLogEntry> result = parser.conjunction();
+        if (parser.position != parser.tokens.size()) {
+            throw unsupported();
+        }
+        return result;
+    }
+
+    // Logging gives OR higher precedence than AND, unlike SQL.
+    private Predicate<StoredLogEntry> conjunction() {
+        Predicate<StoredLogEntry> result = disjunction();
+        while (position < tokens.size() && !peek(")")) {
+            take("AND"); // Adjacent expressions are implicitly AND-combined.
+            result = result.and(disjunction());
+        }
+        return result;
+    }
+
+    private Predicate<StoredLogEntry> disjunction() {
+        Predicate<StoredLogEntry> result = expression();
+        while (take("OR")) {
+            result = result.or(expression());
+        }
+        return result;
+    }
+
+    private Predicate<StoredLogEntry> expression() {
+        if (take("NOT")) {
+            return expression().negate();
+        }
+        if (take("(")) {
+            Predicate<StoredLogEntry> result = conjunction();
+            if (!take(")")) {
+                throw unsupported();
+            }
+            return result;
+        }
+        if (position + 1 < tokens.size() && tokens.get(position).equalsIgnoreCase("log_id")
+                && tokens.get(position + 1).equals("(")) {
+            return logId();
+        }
+        String field = next();
+        String operator = next();
+        if (!List.of("=", "!=", ":", ">", ">=", "<", "<=").contains(operator)) {
+            throw unsupported();
+        }
+        String raw = next();
+        if (raw.equals("NULL_VALUE") || raw.equals("null")) {
+            throw unsupported();
+        }
+        if (!raw.startsWith("\"") && (!raw.matches("[A-Za-z0-9_./%+@*\\-]+")
+                || List.of("AND", "OR", "NOT").contains(raw))) {
+            throw unsupported();
+        }
+        String expected = decode(raw);
+        Function<StoredLogEntry, Object> accessor = accessor(field);
+        if (operator.equals(":") && raw.equals("*")) {
+            if (field.equals("severity")) {
+                throw unsupported();
+            }
+            Function<StoredLogEntry, Object> object = objectField(field);
+            if (object != null) {
+                String[] path = jsonPath(field.substring(field.indexOf('.') + 1));
+                return entry -> hasPath(object.apply(entry), path, 0);
+            }
+            return entry -> accessor.apply(entry) != null;
+        }
+        if (field.equals("severity")) {
+            int target = severity(expected);
+            return entry -> compare(Integer.compare(severity(entry.getSeverity()), target), operator);
+        }
+        if (field.equals("timestamp") || field.equals("receiveTimestamp")) {
+            Instant target = timestamp(expected);
+            return entry -> accessor.apply(entry) instanceof String actual
+                    && compare(Instant.parse(actual).compareTo(target), operator);
+        }
+        return entry -> {
+            Object actual = accessor.apply(entry);
+            if (actual == null && List.of("textPayload", "trace", "spanId").contains(field)) {
+                actual = "";
+            }
+            return matches(actual, operator, expected);
+        };
+    }
+
+    /**
+     * {@code log_id("cloudaudit.googleapis.com/activity")}: entries whose log ID, URL-decoded, is the
+     * argument. "Don't URL-encode the argument of the log_id function", which then matches nothing.
+     * https://docs.cloud.google.com/logging/docs/view/logging-query-language
+     */
+    private Predicate<StoredLogEntry> logId() {
+        position += 2;
+        String raw = next();
+        if (!raw.startsWith("\"") || !take(")")) {
+            throw unsupported();
+        }
+        String expected = decode(raw);
+        return entry -> {
+            String name = entry.getLogName();
+            int marker = name == null ? -1 : name.indexOf("/logs/");
+            return marker >= 0 && expected.equals(URLDecoder.decode(name.substring(marker + 6), StandardCharsets.UTF_8));
+        };
+    }
+
+    static Function<StoredLogEntry, Object> accessor(String field) {
+        return switch (field) {
+            case "logName" -> StoredLogEntry::getLogName;
+            case "severity" -> StoredLogEntry::getSeverity;
+            case "textPayload" -> StoredLogEntry::getTextPayload;
+            case "timestamp" -> StoredLogEntry::getTimestamp;
+            case "receiveTimestamp" -> StoredLogEntry::getReceiveTimestamp;
+            case "insertId" -> StoredLogEntry::getInsertId;
+            case "trace" -> StoredLogEntry::getTrace;
+            case "spanId" -> StoredLogEntry::getSpanId;
+            case "resource.type" -> StoredLogEntry::getResourceType;
+            default -> {
+                if (field.startsWith("labels.")) {
+                    String key = mapKey(field.substring(7));
+                    yield entry -> entry.getLabels() == null ? null : entry.getLabels().get(key);
+                }
+                if (field.startsWith("resource.labels.")) {
+                    String key = mapKey(field.substring(16));
+                    yield entry -> entry.getResourceLabels() == null ? null : entry.getResourceLabels().get(key);
+                }
+                Function<StoredLogEntry, Object> object = objectField(field);
+                if (object != null) {
+                    String[] path = jsonPath(field.substring(field.indexOf('.') + 1));
+                    yield entry -> lookup(object.apply(entry), path, 0);
+                }
+                throw unsupported();
+            }
+        };
+    }
+
+    /** The JSON-object LogEntry field a path such as {@code protoPayload.methodName} reads, or null. */
+    private static Function<StoredLogEntry, Object> objectField(String field) {
+        if (field.startsWith("jsonPayload.")) {
+            return StoredLogEntry::getJsonPayload;
+        }
+        if (field.startsWith("protoPayload.")) {
+            return StoredLogEntry::getProtoPayload;
+        }
+        if (field.startsWith("operation.")) {
+            return StoredLogEntry::getOperation;
+        }
+        return null;
+    }
+
+    private static String mapKey(String key) {
+        if (!key.startsWith("\"") && !key.matches("[A-Za-z_][A-Za-z0-9_-]*")) {
+            throw unsupported();
+        }
+        return decode(key);
+    }
+
+    private static String[] jsonPath(String field) {
+        List<String> path = new ArrayList<>();
+        int start = 0;
+        boolean quoted = false;
+        for (int index = 0; index <= field.length(); index++) {
+            if (index < field.length() && field.charAt(index) == '\\' && quoted) {
+                index++;
                 continue;
             }
-            predicate = predicate.and(parseClause(trimmed));
-        }
-        return predicate;
-    }
-
-    private static Predicate<StoredLogEntry> parseClause(String clause) {
-        Matcher m = CLAUSE.matcher(clause);
-        if (!m.matches()) {
-            LOG.debugf("Ignoring unrecognized log filter clause: %s", clause);
-            return entry -> true;
-        }
-        String field = m.group(1);
-        String op = m.group(2);
-        String value = unquote(m.group(3).trim());
-
-        if (field.equalsIgnoreCase("logName") || field.equalsIgnoreCase("log_name")) {
-            return entry -> "=".equals(op) && value.equals(entry.getLogName());
-        }
-        if (field.equalsIgnoreCase("severity")) {
-            return severityPredicate(op, value);
-        }
-        if (field.equalsIgnoreCase("resource.type")) {
-            return entry -> "=".equals(op) && value.equals(entry.getResourceType());
-        }
-        if (field.equalsIgnoreCase("timestamp")) {
-            return timestampPredicate(op, value);
-        }
-        if (field.regionMatches(true, 0, "labels.", 0, "labels.".length())) {
-            String key = field.substring("labels.".length());
-            return entry -> "=".equals(op) && entry.getLabels() != null
-                    && value.equals(entry.getLabels().get(key));
-        }
-        LOG.debugf("Ignoring unsupported log filter field: %s", field);
-        return entry -> true;
-    }
-
-    private static Predicate<StoredLogEntry> severityPredicate(String op, String value) {
-        Integer expected = SEVERITY_RANK.get(value.toUpperCase());
-        if (expected == null) {
-            try {
-                expected = Integer.parseInt(value);
-            } catch (NumberFormatException e) {
-                throw GcpException.invalidArgument("Invalid severity in filter: " + value);
+            if (index < field.length() && field.charAt(index) == '"') {
+                quoted = !quoted;
+            }
+            if (index == field.length() || (!quoted && field.charAt(index) == '.')) {
+                String part = field.substring(start, index);
+                if (!part.startsWith("\"") && !part.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+                    throw unsupported();
+                }
+                path.add(decode(part));
+                start = index + 1;
             }
         }
-        final int target = expected;
-        return entry -> {
-            int actual = SEVERITY_RANK.getOrDefault(
-                    entry.getSeverity() == null ? "DEFAULT" : entry.getSeverity().toUpperCase(), 0);
-            return compare(Integer.compare(actual, target), op);
+        return path.toArray(String[]::new);
+    }
+
+    private static boolean hasPath(Object value, String[] path, int index) {
+        if (index == path.length) {
+            return true;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return map.containsKey(path[index]) && hasPath(map.get(path[index]), path, index + 1);
+        }
+        if (value instanceof List<?> list) {
+            return list.stream().anyMatch(item -> hasPath(item, path, index));
+        }
+        return false;
+    }
+
+    private static Object lookup(Object value, String[] path, int index) {
+        if (index == path.length) {
+            return value;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return lookup(map.get(path[index]), path, index + 1);
+        }
+        if (value instanceof List<?> list) {
+            return list.stream().map(item -> lookup(item, path, index)).toList();
+        }
+        return null;
+    }
+
+    private static boolean matches(Object value, String operator, String expected) {
+        if (value instanceof List<?> list) {
+            return list.stream().anyMatch(item -> matches(item, operator, expected));
+        }
+        if (value == null || value instanceof Map<?, ?>
+                || (operator.equals(":") && !(value instanceof String))) {
+            return false;
+        }
+        if (value instanceof Boolean actual) {
+            if (!expected.equalsIgnoreCase("true") && !expected.equalsIgnoreCase("false")) {
+                return false;
+            }
+            return compare(Boolean.compare(actual, Boolean.parseBoolean(expected)), operator);
+        }
+        if (value instanceof Number number) {
+            try {
+                return compare(new BigDecimal(number.toString()).compareTo(new BigDecimal(expected)), operator);
+            } catch (NumberFormatException expectedFailure) {
+                // Logging treats failed scalar conversions as nonmatching comparisons.
+                return false;
+            }
+        }
+        String actual = STRING_NORMALIZER.normalize(value.toString());
+        String target = STRING_NORMALIZER.normalize(expected);
+        return operator.equals(":") ? actual.contains(target) : compare(actual.compareTo(target), operator);
+    }
+
+    private static Instant timestamp(String value) {
+        if (value.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) {
+            return LocalDate.parse(value).atStartOfDay(ZoneOffset.UTC).toInstant();
+        }
+        return Instant.parse(value);
+    }
+
+    private static int severity(String value) {
+        if (value == null) {
+            return 0;
+        }
+        int rank = SEVERITIES.indexOf(value.toUpperCase(Locale.ROOT));
+        return rank >= 0 ? rank * 100 : Integer.parseInt(value);
+    }
+
+    private static boolean compare(int comparison, String operator) {
+        return switch (operator) {
+            case "=" -> comparison == 0;
+            case "!=" -> comparison != 0;
+            case ">" -> comparison > 0;
+            case ">=" -> comparison >= 0;
+            case "<" -> comparison < 0;
+            case "<=" -> comparison <= 0;
+            default -> throw unsupported();
         };
     }
 
-    private static Predicate<StoredLogEntry> timestampPredicate(String op, String value) {
-        final Instant target;
+    private boolean peek(String token) {
+        return position < tokens.size() && tokens.get(position).equals(token);
+    }
+
+    private boolean take(String token) {
+        if (!peek(token)) {
+            return false;
+        }
+        position++;
+        return true;
+    }
+
+    private String next() {
+        if (position == tokens.size()) {
+            throw unsupported();
+        }
+        return tokens.get(position++);
+    }
+
+    private static String decode(String value) {
+        if (!value.startsWith("\"")) {
+            return value;
+        }
         try {
-            target = Instant.parse(value);
-        } catch (Exception e) {
-            throw GcpException.invalidArgument("Invalid timestamp in filter: " + value);
+            return JSON.readValue(value, String.class);
+        } catch (JsonProcessingException exception) {
+            throw unsupported();
         }
-        return entry -> {
-            if (entry.getTimestamp() == null) {
-                return false;
-            }
-            try {
-                return compare(Instant.parse(entry.getTimestamp()).compareTo(target), op);
-            } catch (Exception e) {
-                return false;
-            }
-        };
     }
 
-    private static boolean compare(int cmp, String op) {
-        return switch (op) {
-            case "=" -> cmp == 0;
-            case ">" -> cmp > 0;
-            case ">=" -> cmp >= 0;
-            case "<" -> cmp < 0;
-            case "<=" -> cmp <= 0;
-            default -> false;
-        };
+    private static List<String> tokenize(String filter) {
+        List<String> result = new ArrayList<>();
+        int index = 0;
+        while (index < filter.length()) {
+            char first = filter.charAt(index);
+            if (Character.isWhitespace(first)) {
+                index++;
+                continue;
+            }
+            int start = index;
+            if ("():=<>!".indexOf(first) >= 0) {
+                index++;
+                if (index < filter.length() && (filter.charAt(index) == '=' || filter.charAt(index) == '~')) {
+                    index++;
+                }
+            } else {
+                boolean quoted = false;
+                while (index < filter.length()) {
+                    char character = filter.charAt(index);
+                    if (character == '\\' && quoted) {
+                        index += 2;
+                        continue;
+                    }
+                    if (character == '"') {
+                        quoted = !quoted;
+                    }
+                    if (!quoted && (Character.isWhitespace(character) || "():=<>!".indexOf(character) >= 0)) {
+                        break;
+                    }
+                    index++;
+                }
+                if (quoted || index > filter.length()) {
+                    throw unsupported();
+                }
+            }
+            result.add(filter.substring(start, index));
+        }
+        return result;
     }
 
-    private static String unquote(String s) {
-        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
-            return s.substring(1, s.length() - 1);
-        }
-        return s;
+    private static GcpException unsupported() {
+        return GcpException.invalidArgument("Unsupported Cloud Logging filter expression");
     }
 }

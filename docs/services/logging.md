@@ -112,21 +112,20 @@ the API endpoint / transport channel and disabling credentials:
     entries.forEach((e) => console.log(e.textPayload));
     ```
 
-## Filter subset
+## Filters
 
-`ListLogEntries` supports a practical subset of the Cloud Logging filter language, combined with
-`AND`:
+`ListLogEntries` evaluates the same subset of the
+[Logging query language](https://docs.cloud.google.com/logging/docs/view/logging-query-language) as sinks,
+exclusions and log-based metrics (see [Routing filters](#routing-filters-and-hierarchy)): `AND`, `OR`,
+`NOT`, parentheses, comparisons, `:` containment and `:*` presence on the LogEntry fields listed there,
+and `log_id("LOG_ID")`. An empty filter matches all entries in the requested `resourceNames`. A filter
+that uses anything else (regular expressions, `sample()`, `search()`, other functions, `httpRequest`)
+fails with `INVALID_ARGUMENT` instead of being ignored, so a query never matches more than it says.
 
-| Field | Operators | Example |
-|---|---|---|
-| `logName` | `=` | `logName="projects/p/logs/app"` |
-| `severity` | `=` `>` `>=` `<` `<=` | `severity>=WARNING` |
-| `resource.type` | `=` | `resource.type="gce_instance"` |
-| `timestamp` | `=` `>` `>=` `<` `<=` | `timestamp>="2026-01-01T00:00:00Z"` |
-| `labels.<key>` | `=` | `labels.env="prod"` |
-
-An empty filter matches all entries in the requested `resourceNames`. `OR`/`NOT`, functions,
-regex, and nested parentheses are not supported; unrecognized clauses are ignored.
+`pageSize` defaults to 50, as in the
+[entries.list reference](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/list)
+("Default is 50. If the value is negative, the request is rejected."); a negative value fails with
+`INVALID_ARGUMENT`. Entries with equal timestamps are returned in `insertId` order.
 
 ## Entry semantics
 
@@ -134,9 +133,8 @@ regex, and nested parentheses are not supported; unrecognized clauses are ignore
   labels win over request defaults).
 - Missing `insertId` and `timestamp` are filled in; `receiveTimestamp` is always set to now.
 - `protoPayload` is kept when its type is `type.googleapis.com/google.cloud.audit.AuditLog`, the payload
-  Cloud Audit Logs entries carry, and read back unchanged over both transports and in exports. Sink,
-  exclusion and log-based metric filters read its fields (see [Routing filters](#routing-filters-and-hierarchy));
-  the `ListLogEntries` subset above does not.
+  Cloud Audit Logs entries carry, and read back unchanged over both transports and in exports. Filters read
+  its fields (see [Filters](#filters)).
   The [LogEntry reference](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry) supports
   only AuditLog and `google.appengine.logging.v1.RequestLog` ("user-defined types are not supported"); a
   RequestLog or any other type is dropped from the entry, which is still written. An AuditLog that does not
@@ -241,12 +239,12 @@ permissions are granted; later writes can export normally.
 
 ### Routing filters and hierarchy
 
-Routing uses a strict subset independent of the lenient `ListLogEntries` parser:
+Routing and `ListLogEntries` use a strict subset:
 
 - `AND`, implicit conjunction (including newlines), `OR`, `NOT`, and parentheses. As in Logging,
   `OR` binds more tightly than `AND`.
 - `logName`, `severity`, `resource.type`, `resource.labels.<key>`, `labels.<key>`, `textPayload`,
-  `jsonPayload.<path>`, `protoPayload.<path>` (such as `protoPayload.methodName` or
+  `log_id("LOG_ID")`, `jsonPayload.<path>`, `protoPayload.<path>` (such as `protoPayload.methodName` or
   `protoPayload.authenticationInfo.principalEmail`), `operation.<path>`, `timestamp`, `receiveTimestamp`,
   `insertId`, `trace`, and `spanId`.
 - Equality/inequality and ordering comparisons, string containment (`:`), and field presence

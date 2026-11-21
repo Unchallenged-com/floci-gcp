@@ -18,10 +18,10 @@ final class SinkRouting {
     }
 
     List<StoredLogEntry> select(String parent, LogSink sink, List<StoredLogEntry> entries) {
-        Predicate<StoredLogEntry> matches = SinkLogEntryFilter.parse(sink.getFilter());
+        Predicate<StoredLogEntry> matches = LogEntryFilter.parse(sink.getFilter());
         for (LogExclusion exclusion : sink.getExclusionsList()) {
             if (!exclusion.getDisabled()) {
-                matches = matches.and(SinkLogEntryFilter.parse(exclusion.getFilter()).negate());
+                matches = matches.and(LogEntryFilter.parse(exclusion.getFilter()).negate());
             }
         }
         Predicate<StoredLogEntry> routed = matches;
