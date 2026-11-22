@@ -488,6 +488,7 @@ and counted by log-based metrics like any other entry.
 | IAM (`iam.googleapis.com`) | `google.iam.admin.v1.` `CreateServiceAccount`, `PatchServiceAccount`, `UpdateServiceAccount`, `DeleteServiceAccount`, `DisableServiceAccount`, `EnableServiceAccount`, `CreateServiceAccountKey`, `DeleteServiceAccountKey`, `SetIAMPolicy` | `service_account` (`email_id`, `project_id`, `unique_id`) |
 | Resource Manager (`cloudresourcemanager.googleapis.com`) | `SetIamPolicy` on a project, over REST and the IAM policy gRPC mixin | `project` (`project_id`) |
 | Cloud Logging (`logging.googleapis.com`) | `google.logging.v2.ConfigServiceV2.` `CreateSink`, `UpdateSink`, `DeleteSink` for project sinks, over REST and gRPC | `logging_sink` (`project_id`, `destination` empty, `name`) |
+| Compute Engine (`compute.googleapis.com`) | `v1.compute.{collection}.{method}` for every create, delete, update, `setLabels` and action the REST API serves, each as a long-running operation: a first entry with the request and permission check (`operation.first`) and a last one (`operation.last`) with the same `operation.id` | `gce_instance`, `gce_disk`, `gce_firewall_rule`, `gce_network`, `gce_subnetwork`; `audited_resource` for other collections |
 
 Each entry carries `serviceName`, `methodName`, `resourceName`, `status` (`{}` on success, the call's
 code and message otherwise), `authenticationInfo` (`principalEmail` and `principalSubject` of a

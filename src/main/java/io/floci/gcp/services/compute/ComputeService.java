@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.LocationCatalog;
@@ -16,7 +17,11 @@ import io.floci.gcp.core.storage.StorageFactory;
 import io.floci.gcp.services.compute.model.ComputeOperation;
 import io.floci.gcp.services.compute.model.ComputeProject;
 import io.floci.gcp.services.iam.IamPolicyCodec;
+import io.floci.gcp.services.iam.IamResource;
 import io.floci.gcp.services.iam.IamService;
+import io.floci.gcp.services.iam.authorization.AuditTrail;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
+import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -49,11 +54,13 @@ public class ComputeService {
     private final ComputeInstanceRuntime runtime;
     private final ComputeImageCatalog images;
     private final IamService iamService;
+    private final Instance<AuditTrail> auditTrail;
 
     @Inject
     public ComputeService(StorageFactory factory, EmulatorConfig config, ServiceRegistry registry,
                           Instance<ComputeResourceHandler> handlers, LocationCatalog locations,
-                          ComputeInstanceRuntime runtime, ComputeImageCatalog images, IamService iamService) {
+                          ComputeInstanceRuntime runtime, ComputeImageCatalog images, IamService iamService,
+                          Instance<AuditTrail> auditTrail) {
         this.store = (ProjectAwareStorageBackend<ComputeProject>) factory.<ComputeProject>create("compute", "compute.json", new TypeReference<Map<String, ComputeProject>>() {});
         this.config = config;
         this.registry = registry;
@@ -62,6 +69,7 @@ public class ComputeService {
         this.runtime = runtime;
         this.images = images;
         this.iamService = iamService;
+        this.auditTrail = auditTrail;
     }
     void start(@Observes StartupEvent event) {
         config.services().compute().regions().ifPresent(allowed -> allowed.stream()
@@ -426,7 +434,74 @@ public class ComputeService {
                 handler.update(c, resource, body, verb); operationType = "update";
             } else { throw GcpException.unimplemented("Unsupported Compute method"); }
         }
-        return operation(c, resource, operationType, requestId, requestKey);
+        ObjectNode response = operation(c, resource, operationType, requestId, requestKey);
+        audit(project, c.collection(), operationType, resource, body, response);
+        return response;
+    }
+
+    /**
+     * Records a Compute Engine change as captured entries do: a long-running operation writes a first entry,
+     * checked with {@code compute.{collection}.{verb}} and carrying the request, and a last one with the same
+     * {@code operation.id} and {@code producer}, no authorization and a request naming only its type
+     * ({@code type.googleapis.com/compute.{collection}.{method}}). Methods are {@code v1.compute.{collection}.{method}}
+     * (https://docs.cloud.google.com/compute/docs/logging/audit-logging); resources are {@code gce_instance},
+     * {@code gce_disk}, {@code gce_firewall_rule}, {@code gce_network} or {@code gce_subnetwork} (resource list),
+     * else {@code audited_resource}.
+     */
+    private void audit(String project, String collection, String method, ObjectNode resource, ObjectNode body,
+            ObjectNode response) {
+        if (auditTrail == null || !auditTrail.isResolvable()) {
+            return;
+        }
+        String self = resource.path("selfLink").asText("");
+        int marker = self.indexOf("/projects/");
+        if (marker < 0) {
+            return;
+        }
+        String resourceName = self.substring(marker + 1);
+        String methodName = "v1.compute." + collection + "." + method;
+        String zone = resource.path("zone").asText("");
+        zone = zone.substring(zone.lastIndexOf('/') + 1);
+        String region = resource.path("region").asText("");
+        region = region.substring(region.lastIndexOf('/') + 1);
+        String id = resource.path("id").asText("");
+        Map<String, String> labels = new LinkedHashMap<>();
+        String type;
+        switch (collection) {
+            case "instances" -> { type = "gce_instance"; labels.put("instance_id", id); labels.put("project_id", project);
+                labels.put("zone", zone); }
+            case "disks" -> { type = "gce_disk"; labels.put("disk_id", id); labels.put("project_id", project);
+                labels.put("zone", zone); }
+            case "firewalls" -> { type = "gce_firewall_rule"; labels.put("firewall_rule_id", id);
+                labels.put("project_id", project); }
+            case "networks" -> { type = "gce_network"; labels.put("network_id", id); labels.put("project_id", project); }
+            case "subnetworks" -> { type = "gce_subnetwork"; labels.put("subnetwork_id", id);
+                labels.put("subnetwork_name", resource.path("name").asText("")); labels.put("location", region);
+                labels.put("project_id", project); }
+            default -> { type = "audited_resource"; labels.put("method", methodName); labels.put("project_id", project);
+                labels.put("service", "compute.googleapis.com"); }
+        }
+        String verb = switch (method) {
+            case "insert" -> "create";
+            default -> method;
+        };
+        String operationId = response.path("name").asText("");
+        Map<String, Object> first = new LinkedHashMap<>();
+        first.put("@type", "type.googleapis.com/compute." + collection + "." + method);
+        if (body != null && body.size() > 0) {
+            first.putAll(JSON.convertValue(body, new TypeReference<Map<String, Object>>() {}));
+        }
+        String projectName = "projects/" + project;
+        IamResource checked = new IamResource("compute.googleapis.com", "compute." + collection, resourceName,
+                resourceName, projectName);
+        auditTrail.get().record(new AuditedMethod("compute.googleapis.com", methodName, resourceName, projectName,
+                type, labels, first, null, PermissionType.ADMIN_WRITE, false, List.of(),
+                Map.of("id", operationId, "producer", "compute.googleapis.com", "first", true)),
+                List.of(new IamPermissionCheck("compute." + collection + "." + verb, checked)));
+        auditTrail.get().record(new AuditedMethod("compute.googleapis.com", methodName, resourceName, projectName,
+                type, labels, Map.of("@type", "type.googleapis.com/compute." + collection + "." + method), null,
+                PermissionType.ADMIN_WRITE, false, List.of(),
+                Map.of("id", operationId, "producer", "compute.googleapis.com", "last", true)), List.of());
     }
     /** The policy name is canonical, so a numeric ID and a resource name reach the same policy. */
     private static String policyName(String project, ObjectNode resource) {

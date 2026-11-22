@@ -238,6 +238,9 @@ public class AuditLogRecorder implements AuditTrail {
         entry.setSeverity(code != Code.OK_VALUE ? "ERROR" : isAdminActivity(method) ? "NOTICE" : "INFO");
         entry.setTimestamp(call.time().toString());
         entry.setProtoPayload(ProtoPayloads.fromAny(Any.pack(audit.build())));
+        if (method.operation() != null) {
+            entry.setOperation(method.operation());
+        }
         return entry;
     }
 
