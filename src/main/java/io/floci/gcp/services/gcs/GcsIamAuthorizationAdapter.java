@@ -78,8 +78,9 @@ public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
 
     /**
      * The Data Access entry of a Cloud Storage call checked with {@code permission}, or empty when it is not
-     * audited. Types follow https://docs.cloud.google.com/storage/docs/audit-logging (getting bucket metadata,
-     * listing buckets and getting IAM policies are ADMIN_READ; getting and listing objects DATA_READ; creating
+     * audited. Types follow https://docs.cloud.google.com/storage/docs/audit-logging (updating and deleting
+     * buckets and setting their IAM policy are ADMIN_WRITE; getting bucket metadata, listing buckets and getting
+     * IAM policies are ADMIN_READ; getting and listing objects DATA_READ; creating
      * and deleting objects DATA_WRITE). Method names, resource names and the {@code gcs_bucket} resource follow
      * captured entries, which carry no {@code permissionType} and empty resource attributes. {@code object} is
      * null for a bucket-level call; a bucket that does not exist is not audited.
@@ -89,6 +90,8 @@ public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
             case "storage.objects.get", "storage.objects.list" -> PermissionType.DATA_READ;
             case "storage.objects.create", "storage.objects.delete" -> PermissionType.DATA_WRITE;
             case "storage.buckets.get", "storage.buckets.getIamPolicy" -> PermissionType.ADMIN_READ;
+            case "storage.buckets.update", "storage.buckets.delete", "storage.buckets.setIamPolicy" ->
+                    PermissionType.ADMIN_WRITE;
             default -> null;
         };
         if (type == null) {
@@ -101,15 +104,33 @@ public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
             return Optional.empty();
         }
         String location = meta.getLocation() == null ? "" : meta.getLocation().toLowerCase(Locale.ROOT);
-        String method = "storage.buckets.getIamPolicy".equals(permission) ? "storage.getIamPermissions" : permission;
+        String method = switch (permission) {
+            case "storage.buckets.getIamPolicy" -> "storage.getIamPermissions";
+            case "storage.buckets.setIamPolicy" -> "storage.setIamPermissions";
+            default -> permission;
+        };
         String name = "projects/_/buckets/" + bucket
                 + (object != null && !"storage.objects.list".equals(permission) ? "/objects/" + object : "");
         Map<String, String> labels = new LinkedHashMap<>();
         labels.put("bucket_name", bucket);
         labels.put("location", location);
         labels.put("project_id", meta.getProjectId());
+        String policy = "storage.buckets.setIamPolicy".equals(permission) ? IamResource.gcsBucket(bucket).policyResource()
+                : null;
         return Optional.of(new AuditedMethod(STORAGE, method, name, "projects/" + meta.getProjectId(), "gcs_bucket",
-                labels, null, null, type, true, location.isEmpty() ? List.of() : List.of(location)));
+                labels, null, policy, type, true, location.isEmpty() ? List.of() : List.of(location)));
+    }
+
+    /** {@code storage.buckets.create}, recorded before the bucket exists, as captured on a {@code gcs_bucket}. */
+    public AuditedMethod bucketCreateAuditedMethod(String project, String bucket, String location) {
+        String region = location == null || location.isBlank() ? "us" : location.toLowerCase(Locale.ROOT);
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("bucket_name", bucket);
+        labels.put("location", region);
+        labels.put("project_id", project);
+        return new AuditedMethod(STORAGE, "storage.buckets.create", "projects/_/buckets/" + bucket,
+                "projects/" + project, "gcs_bucket", labels, null, null, PermissionType.ADMIN_WRITE, true,
+                List.of(region));
     }
 
     /** {@code storage.buckets.list} in a project, as captured: resource {@code projects/_/buckets/*}. */

@@ -40,6 +40,16 @@ public class GcsIamAuthorizationService {
         this(cabAuthorization, authorization, adapter, null);
     }
 
+    /** Records {@code storage.buckets.create}, which Cloud Storage authorizes in the project, not the bucket. */
+    public void recordBucketCreate(String authorizationHeader, String project, String bucket, String location) {
+        if (project == null || project.isBlank() || bucket == null || !isAuthenticatedCaller(authorizationHeader)
+                || auditTrail == null || !auditTrail.isResolvable()) {
+            return;
+        }
+        auditTrail.get().record(adapter.bucketCreateAuditedMethod(project, bucket, location),
+                List.of(new IamPermissionCheck("storage.buckets.create", IamResource.project("projects/" + project))));
+    }
+
     /** Records {@code storage.buckets.list}, which Cloud Storage does not authorize per bucket. */
     public void recordBucketList(String authorizationHeader, String project) {
         if (project == null || project.isBlank() || !isAuthenticatedCaller(authorizationHeader)
@@ -58,6 +68,7 @@ public class GcsIamAuthorizationService {
 
     public <T> T withBucketPermission(String authorizationHeader, String bucket, String permission,
             Supplier<T> action) {
+        audit(authorizationHeader, bucket, null, permission);
         cabAuthorization.rejectDownscopedToken(authorizationHeader);
         if (!authorization.enabled()) {
             return authorization.withPolicyLocks(IamResource.gcsBucket(bucket), action);

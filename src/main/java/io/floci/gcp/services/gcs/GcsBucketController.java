@@ -88,6 +88,8 @@ public class GcsBucketController {
         if (name == null || name.isBlank()) {
             throw GcpException.invalidArgument("bucket name is required");
         }
+        iamAuthorizationService.recordBucketCreate(headers.getHeaderString(HttpHeaders.AUTHORIZATION), project, name,
+                parsed != null && parsed.get("location") instanceof String location ? location : null);
         GcsBucket bucket = service.createBucket(name, project, requestBaseUrl(headers), parsed,
                 headers.getHeaderString(HttpHeaders.AUTHORIZATION));
         return Response.ok(bucket).build();
