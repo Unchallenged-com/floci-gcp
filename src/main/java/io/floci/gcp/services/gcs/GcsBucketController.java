@@ -110,6 +110,7 @@ public class GcsBucketController {
             @QueryParam("maxResults") @DefaultValue("0") int maxResults,
 			@HeaderParam(HttpHeaders.AUTHORIZATION) String authorization,
             @QueryParam("pageToken") String pageToken) {
+		iamAuthorizationService.recordBucketList(authorization, project);
 		authorizationService.rejectDownscopedToken(authorization);
         List<GcsBucket> all = service.listBuckets(project);
         PageToken.Page<GcsBucket> page = PageToken.paginate(all, maxResults, pageToken);

@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -17,12 +18,23 @@ import java.util.Map;
  *        after the call gives the entry's {@code policyDelta} and {@code response}
  * @param permissionType the type of the permission the method checks: {@code ADMIN_WRITE} methods write
  *        Admin Activity entries, the other types Data Access entries when the policy's auditConfigs enable them
+ * @param bareAuthorization true when the entry's {@code authorizationInfo} carries neither a {@code permissionType}
+ *        nor resource attributes, as Cloud Storage entries are captured
+ * @param resourceLocations the {@code resourceLocation.currentLocations} of the entry, empty for none
  */
 public record AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
         String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
-        String policyResource, PermissionType permissionType) {
+        String policyResource, PermissionType permissionType, boolean bareAuthorization,
+        List<String> resourceLocations) {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    public AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
+            String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
+            String policyResource, PermissionType permissionType) {
+        this(serviceName, methodName, resourceName, logParent, resourceType, resourceLabels, request, policyResource,
+                permissionType, false, List.of());
+    }
 
     /** An Admin Activity method. */
     public AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,

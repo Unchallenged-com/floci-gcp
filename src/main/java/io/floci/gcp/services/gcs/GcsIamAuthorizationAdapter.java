@@ -1,7 +1,10 @@
 package io.floci.gcp.services.gcs;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
+import io.floci.gcp.services.gcs.model.GcsBucket;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamIdentityKind;
 import io.floci.gcp.services.iam.authorization.IamOperation;
@@ -10,7 +13,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -18,6 +23,8 @@ import java.util.Set;
 /** GCS resource mapping for the shared evaluator. Enforcement remains in the service path. */
 @ApplicationScoped
 public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
+
+    private static final String STORAGE = "storage.googleapis.com";
 
     private final Instance<GcsService> services;
 
@@ -67,6 +74,48 @@ public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
 
     public IamResource objectResource(String bucket, String object) {
         return IamResource.gcsObject(bucket, object, services.get().bucketProject(bucket));
+    }
+
+    /**
+     * The Data Access entry of a Cloud Storage call checked with {@code permission}, or empty when it is not
+     * audited. Types follow https://docs.cloud.google.com/storage/docs/audit-logging (getting bucket metadata,
+     * listing buckets and getting IAM policies are ADMIN_READ; getting and listing objects DATA_READ; creating
+     * and deleting objects DATA_WRITE). Method names, resource names and the {@code gcs_bucket} resource follow
+     * captured entries, which carry no {@code permissionType} and empty resource attributes. {@code object} is
+     * null for a bucket-level call; a bucket that does not exist is not audited.
+     */
+    public Optional<AuditedMethod> storageAuditedMethod(String bucket, String object, String permission) {
+        PermissionType type = switch (permission) {
+            case "storage.objects.get", "storage.objects.list" -> PermissionType.DATA_READ;
+            case "storage.objects.create", "storage.objects.delete" -> PermissionType.DATA_WRITE;
+            case "storage.buckets.get", "storage.buckets.getIamPolicy" -> PermissionType.ADMIN_READ;
+            default -> null;
+        };
+        if (type == null) {
+            return Optional.empty();
+        }
+        GcsBucket meta;
+        try {
+            meta = services.get().getBucket(bucket);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+        String location = meta.getLocation() == null ? "" : meta.getLocation().toLowerCase(Locale.ROOT);
+        String method = "storage.buckets.getIamPolicy".equals(permission) ? "storage.getIamPermissions" : permission;
+        String name = "projects/_/buckets/" + bucket
+                + (object != null && !"storage.objects.list".equals(permission) ? "/objects/" + object : "");
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("bucket_name", bucket);
+        labels.put("location", location);
+        labels.put("project_id", meta.getProjectId());
+        return Optional.of(new AuditedMethod(STORAGE, method, name, "projects/" + meta.getProjectId(), "gcs_bucket",
+                labels, null, null, type, true, location.isEmpty() ? List.of() : List.of(location)));
+    }
+
+    /** {@code storage.buckets.list} in a project, as captured: resource {@code projects/_/buckets/*}. */
+    public AuditedMethod bucketListAuditedMethod(String project) {
+        return new AuditedMethod(STORAGE, "storage.buckets.list", "projects/_/buckets/*", "projects/" + project,
+                "gcs_bucket", Map.of("project_id", project), null, null, PermissionType.ADMIN_READ, true, List.of());
     }
 
     @Override

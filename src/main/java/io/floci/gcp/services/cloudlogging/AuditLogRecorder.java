@@ -6,6 +6,7 @@ import com.google.cloud.audit.AuditLog;
 import com.google.cloud.audit.AuthenticationInfo;
 import com.google.cloud.audit.AuthorizationInfo;
 import com.google.cloud.audit.RequestMetadata;
+import com.google.cloud.audit.ResourceLocation;
 import com.google.iam.v1.BindingDelta;
 import com.google.iam.v1.PolicyDelta;
 import com.google.iam.v1.logging.AuditData;
@@ -23,11 +24,14 @@ import io.floci.gcp.services.iam.IamResource;
 import io.floci.gcp.services.iam.IamResourceHierarchy;
 import io.floci.gcp.services.iam.IamService;
 import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditTrail;
 import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.floci.gcp.services.iam.model.StoredPolicy;
+import io.grpc.Context;
+import io.quarkus.arc.Arc;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -40,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Writes Cloud Audit Logs entries for the calls the IAM authorization adapters describe with
@@ -53,7 +58,7 @@ import java.util.Set;
  * {@code google/cloud/audit/audit_log.proto}, and each service's audit logging page for its methods.
  */
 @ApplicationScoped
-public class AuditLogRecorder {
+public class AuditLogRecorder implements AuditTrail {
 
     static final String ACTIVITY_LOG_ID = "cloudaudit.googleapis.com%2Factivity";
     static final String DATA_ACCESS_LOG_ID = "cloudaudit.googleapis.com%2Fdata_access";
@@ -67,15 +72,42 @@ public class AuditLogRecorder {
     private final IamPrincipalResolver principals;
     private final ObjectMapper json;
     private final Instance<IamResourceHierarchy> hierarchy;
+    private final Instance<AuditRequestScope> requestScope;
 
     @Inject
     public AuditLogRecorder(Instance<CloudLoggingService> logging, Instance<IamService> iam,
-            IamPrincipalResolver principals, ObjectMapper json, Instance<IamResourceHierarchy> hierarchy) {
+            IamPrincipalResolver principals, ObjectMapper json, Instance<IamResourceHierarchy> hierarchy,
+            Instance<AuditRequestScope> requestScope) {
         this.logging = logging;
         this.iam = iam;
         this.principals = principals;
         this.json = json;
         this.hierarchy = hierarchy;
+        this.requestScope = requestScope;
+    }
+
+    /** gRPC calls carry their {@link Scope} in the call context; REST calls in {@link AuditRequestScope}. */
+    static final Context.Key<Scope> GRPC_SCOPE = Context.key("audit-scope");
+
+    /**
+     * One transport call: who made it and from where, and the entries recorded for it, completed by the
+     * transport with the call's status.
+     */
+    public static final class Scope {
+        private final String authorization;
+        private final String callerIp;
+        private final String userAgent;
+        private final List<Call> pending = new CopyOnWriteArrayList<>();
+
+        public Scope(String authorization, String callerIp, String userAgent) {
+            this.authorization = authorization;
+            this.callerIp = callerIp;
+            this.userAgent = userAgent;
+        }
+
+        void add(Call call) {
+            pending.add(call);
+        }
     }
 
     /** What is known of an audited call before it runs. */
@@ -84,25 +116,55 @@ public class AuditLogRecorder {
             String userAgent, Instant time, StoredPolicy policyBefore) {
     }
 
-    /** The call's audit context, or empty when the call is not audited. Never fails the call. */
-    public Optional<Call> begin(IamAuthorizationAdapter adapter, IamOperation operation, AuditRequest request,
-            String authorization, String callerIp, String userAgent) {
+    /** Records the call an adapter describes, if it does, in the transport's scope. Never fails the call. */
+    public void begin(Scope scope, IamAuthorizationAdapter adapter, IamOperation operation, AuditRequest request) {
         Instant time = Instant.now();
         try {
             Optional<AuditedMethod> method = adapter.auditedMethod(operation, request);
             if (method.isEmpty()) {
-                return Optional.empty();
+                return;
             }
-            return Optional.of(new Call(adapter, operation, request, method.get(), checks(adapter, operation),
-                    principal(authorization), callerIp, userAgent, time, policy(method.get().policyResource())));
+            scope.add(new Call(adapter, operation, request, method.get(), checks(adapter, operation),
+                    principal(scope.authorization), scope.callerIp, scope.userAgent, time,
+                    policy(method.get().policyResource())));
         } catch (RuntimeException e) {
             LOG.debugf(e, "No audit entry for %s on %s", operation.name(), operation.resource());
-            return Optional.empty();
         }
     }
 
-    /** Writes the call's entry; {@code code} is the call's {@code google.rpc.Code}. Never fails the call. */
-    public void complete(Call call, int code, String message) {
+    /** Records a call a service describes itself, in the scope of the transport call it runs in. */
+    @Override
+    public void record(AuditedMethod method, List<IamPermissionCheck> checks) {
+        Scope scope = currentScope();
+        if (scope == null) {
+            LOG.debugf("No transport call to audit %s on %s", method.methodName(), method.resourceName());
+            return;
+        }
+        scope.add(new Call(null, null, null, method, checks, principal(scope.authorization), scope.callerIp,
+                scope.userAgent, Instant.now(), policy(method.policyResource())));
+    }
+
+    /** Writes every entry recorded in the scope; {@code code} is the call's {@code google.rpc.Code}. */
+    public void complete(Scope scope, int code, String message) {
+        for (Call call : scope.pending) {
+            complete(call, code, message);
+        }
+        scope.pending.clear();
+    }
+
+    private Scope currentScope() {
+        Scope grpc = GRPC_SCOPE.get();
+        if (grpc != null) {
+            return grpc;
+        }
+        if (Arc.container() != null && Arc.container().requestContext().isActive()) {
+            return requestScope.get().scope();
+        }
+        return null;
+    }
+
+    /** Writes the call's entry. Never fails the call. */
+    private void complete(Call call, int code, String message) {
         try {
             if (!isAdminActivity(call.method()) && !dataAccessEnabled(call.method(), call.principal())) {
                 return;
@@ -139,15 +201,23 @@ public class AuditLogRecorder {
                         .setDestinationAttributes(AttributeContext.Peer.getDefaultInstance()));
         // Real entries name the checked resource as resourceName does, e.g. projects/-/serviceAccounts/{uniqueId}.
         for (IamPermissionCheck check : call.checks()) {
-            audit.addAuthorizationInfo(AuthorizationInfo.newBuilder()
+            AuthorizationInfo.Builder authorization = AuthorizationInfo.newBuilder()
                     .setResource(method.resourceName())
                     .setPermission(check.permission())
-                    .setGranted(code != Code.PERMISSION_DENIED_VALUE)
-                    .setResourceAttributes(AttributeContext.Resource.newBuilder()
-                            .setService(check.resource().service())
-                            .setName(method.resourceName())
-                            .setType(check.resource().type()))
-                    .setPermissionType(method.permissionType()));
+                    .setGranted(code != Code.PERMISSION_DENIED_VALUE);
+            if (method.bareAuthorization()) {
+                authorization.setResourceAttributes(AttributeContext.Resource.getDefaultInstance());
+            } else {
+                authorization.setResourceAttributes(AttributeContext.Resource.newBuilder()
+                                .setService(check.resource().service())
+                                .setName(method.resourceName())
+                                .setType(check.resource().type()))
+                        .setPermissionType(method.permissionType());
+            }
+            audit.addAuthorizationInfo(authorization);
+        }
+        if (!method.resourceLocations().isEmpty()) {
+            audit.setResourceLocation(ResourceLocation.newBuilder().addAllCurrentLocations(method.resourceLocations()));
         }
         if (method.request() != null) {
             audit.setRequest(Structs.toStruct(method.request()));
@@ -216,6 +286,9 @@ public class AuditLogRecorder {
     }
 
     private static Optional<AuditedMethod> after(Call call) {
+        if (call.adapter() == null) {
+            return Optional.empty();
+        }
         try {
             return call.adapter().auditedMethod(call.operation(), call.request());
         } catch (RuntimeException e) {

@@ -3,9 +3,11 @@ package io.floci.gcp.services.iam;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.credentials.GcsAuthorizationService;
 import io.floci.gcp.services.gcs.GcsIamAuthorizationAdapter;
+import io.floci.gcp.services.iam.authorization.AuditTrail;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationService;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
 import java.util.List;
@@ -21,16 +23,35 @@ public class GcsIamAuthorizationService {
     private final GcsAuthorizationService cabAuthorization;
     private final IamAuthorizationService authorization;
     private final GcsIamAuthorizationAdapter adapter;
+    private final Instance<AuditTrail> auditTrail;
 
     @Inject
     public GcsIamAuthorizationService(GcsAuthorizationService cabAuthorization,
-            IamAuthorizationService authorization, GcsIamAuthorizationAdapter adapter) {
+            IamAuthorizationService authorization, GcsIamAuthorizationAdapter adapter, Instance<AuditTrail> auditTrail) {
         this.cabAuthorization = cabAuthorization;
         this.authorization = authorization;
         this.adapter = adapter;
+        this.auditTrail = auditTrail;
+    }
+
+    /** Without an audit trail, for tests of the authorization alone. */
+    public GcsIamAuthorizationService(GcsAuthorizationService cabAuthorization,
+            IamAuthorizationService authorization, GcsIamAuthorizationAdapter adapter) {
+        this(cabAuthorization, authorization, adapter, null);
+    }
+
+    /** Records {@code storage.buckets.list}, which Cloud Storage does not authorize per bucket. */
+    public void recordBucketList(String authorizationHeader, String project) {
+        if (project == null || project.isBlank() || !isAuthenticatedCaller(authorizationHeader)
+                || auditTrail == null || !auditTrail.isResolvable()) {
+            return;
+        }
+        auditTrail.get().record(adapter.bucketListAuditedMethod(project),
+                List.of(new IamPermissionCheck("storage.buckets.list", IamResource.project("projects/" + project))));
     }
 
     public void requireBucketPermission(String authorizationHeader, String bucket, String permission) {
+        audit(authorizationHeader, bucket, null, permission);
         cabAuthorization.rejectDownscopedToken(authorizationHeader);
         requireBucketIamPermission(authorizationHeader, bucket, permission);
     }
@@ -59,16 +80,19 @@ public class GcsIamAuthorizationService {
     }
 
     public void requireObjectRead(String authorizationHeader, String bucket, String object) {
+        audit(authorizationHeader, bucket, object, "storage.objects.get");
         cabAuthorization.requireObjectRead(authorizationHeader, bucket, object);
         requireObjectIamPermission(authorizationHeader, bucket, object, "storage.objects.get");
     }
 
     public void requireObjectList(String authorizationHeader, String bucket, String prefix) {
+        audit(authorizationHeader, bucket, null, "storage.objects.list");
         cabAuthorization.requireObjectList(authorizationHeader, bucket, prefix);
         requireBucketIamPermission(authorizationHeader, bucket, "storage.objects.list");
     }
 
     public void requireObjectWrite(String authorizationHeader, String bucket, String object, String permission) {
+        audit(authorizationHeader, bucket, object, permission);
         cabAuthorization.requireObjectWrite(authorizationHeader, bucket, object);
         requireObjectIamPermission(authorizationHeader, bucket, object, permission);
     }
@@ -145,6 +169,7 @@ public class GcsIamAuthorizationService {
     }
 
     public void requireObjectDelete(String authorizationHeader, String bucket, String object) {
+        audit(authorizationHeader, bucket, object, "storage.objects.delete");
         cabAuthorization.requireObjectDelete(authorizationHeader, bucket, object);
         requireObjectIamPermission(authorizationHeader, bucket, object, "storage.objects.delete");
     }
@@ -221,6 +246,24 @@ public class GcsIamAuthorizationService {
         boolean allowed = isAllowed(() -> requireObjectIamPermission(
                 authorizationHeader, bucket, object, "storage.objects.delete"));
         return allowed ? () -> { } : deniedPermission();
+    }
+
+    /**
+     * Records the call's Data Access entry before it is authorized, so a refusal is recorded too. "Cloud Audit
+     * Logs doesn't track access to resources that are public through allUsers or allAuthenticatedUsers", so a
+     * call without credentials is not recorded.
+     */
+    private void audit(String authorizationHeader, String bucket, String object, String permission) {
+        if (!isAuthenticatedCaller(authorizationHeader) || auditTrail == null || !auditTrail.isResolvable()) {
+            return;
+        }
+        adapter.storageAuditedMethod(bucket, object, permission).ifPresent(method -> auditTrail.get().record(method,
+                List.of(new IamPermissionCheck(permission, object == null || "storage.objects.list".equals(permission)
+                        ? IamResource.gcsBucket(bucket) : IamResource.gcsObject(bucket, object)))));
+    }
+
+    private static boolean isAuthenticatedCaller(String authorizationHeader) {
+        return authorizationHeader != null && !authorizationHeader.isBlank();
     }
 
     private static Runnable deniedPermission() {

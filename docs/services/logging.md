@@ -520,18 +520,25 @@ recorded when its type is enabled.
 | IAM | `google.iam.admin.v1.` `GetServiceAccount`, `GetServiceAccountKey`, `ListServiceAccountKeys`, `GetIAMPolicy` | `ADMIN_READ` | `service_account` |
 | Resource Manager | `GetIamPolicy` on a project | `ADMIN_READ` | `project` |
 | Cloud Logging | `google.logging.v2.ConfigServiceV2.GetSink` | `ADMIN_READ` | `logging_sink` |
+| Cloud Storage (`storage.googleapis.com`) | `storage.objects.get`, `storage.objects.list` (`DATA_READ`); `storage.objects.create`, `storage.objects.delete` (`DATA_WRITE`); `storage.buckets.get`, `storage.buckets.list`, `storage.getIamPermissions` (`ADMIN_READ`), recorded where Cloud Storage authorizes the call (verified on the JSON API) | see method | `gcs_bucket` (`bucket_name`, `location`, `project_id`) |
+| Cloud Logging | `google.logging.v2.LoggingServiceV2.ListLogEntries`, once per project in `resourceNames` | `DATA_READ` | `audited_resource` (`method`, `project_id`, `service`) |
 | Secret Manager (`secretmanager.googleapis.com`) | `google.cloud.secretmanager.v1.SecretManagerService.` `AccessSecretVersion` (`DATA_READ`); `GetSecret`, `GetSecretVersion`, `ListSecrets`, `ListSecretVersions`, `GetIamPolicy` (`ADMIN_READ`) | see method | `audited_resource` (`method`, `project_id`, `service`) |
 
 Permission types follow each service's audit logging page; Google documents none for IAM Credentials, and
 the emulator uses `DATA_READ`, as a captured GenerateAccessToken entry does. GenerateAccessToken requests
 carry `scope` and `lifetime`, SignJwt requests only `name`, and no secret payload or signed claims are ever
-recorded. Folder policies and BigQuery's always-on Data Access logs are not modeled.
+recorded. Cloud Storage entries carry no `permissionType`, empty resource attributes and the bucket's
+`resourceLocation`, as captured entries do, and no `request`; calls without credentials are not recorded,
+as "Cloud Audit Logs doesn't track access to resources that are public through allUsers or
+allAuthenticatedUsers" ([Cloud Storage audit logging](https://docs.cloud.google.com/storage/docs/audit-logging)).
+Copies, composes, metadata updates and streamed gRPC writes are recorded only through the reads and
+creates they authorize. Folder policies and BigQuery's always-on Data Access logs are not modeled.
 
 Deviations: `insertId` is a UUID; `response` is only written for SetIamPolicy; IAM requests carry the
 request's name and, for CreateServiceAccount, its account fields, not every field; `requestAttributes`
 always has `time`; IAM Credentials entries have no `operation`; entries are written synchronously;
-`principalEmail` is never redacted. System Event and Policy Denied logs, Data Access entries of Cloud
-Storage and `ListLogEntries`, and audit entries of other services, are not written.
+`principalEmail` is never redacted. System Event and Policy Denied logs, and audit entries of other
+services, are not written.
 
 ## Not Yet Supported
 

@@ -49,16 +49,25 @@ public class AuditRestFilter implements ContainerRequestFilter, ContainerRespons
     private final IamAuthorizationRegistry registry;
     private final AuditLogRecorder recorder;
     private final ObjectMapper mapper;
+    private final AuditRequestScope requestScope;
 
     @Inject
-    public AuditRestFilter(IamAuthorizationRegistry registry, AuditLogRecorder recorder, ObjectMapper mapper) {
+    public AuditRestFilter(IamAuthorizationRegistry registry, AuditLogRecorder recorder, ObjectMapper mapper,
+            AuditRequestScope requestScope) {
         this.registry = registry;
         this.recorder = recorder;
         this.mapper = mapper;
+        this.requestScope = requestScope;
     }
 
     @Override
     public void filter(ContainerRequestContext context) throws IOException {
+        String callerIp = httpRequest == null || httpRequest.remoteAddress() == null
+                ? null : httpRequest.remoteAddress().hostAddress();
+        AuditLogRecorder.Scope scope = new AuditLogRecorder.Scope(context.getHeaderString(HttpHeaders.AUTHORIZATION),
+                callerIp, context.getHeaderString(HttpHeaders.USER_AGENT));
+        requestScope.open(scope);
+        context.setProperty(PROPERTY, scope);
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return;
         }
@@ -87,28 +96,23 @@ public class AuditRestFilter implements ContainerRequestFilter, ContainerRespons
             LOG.debugf(e, "No audit mapping for %s", resourceInfo.getResourceMethod().getName());
             return;
         }
-        String callerIp = httpRequest == null || httpRequest.remoteAddress() == null
-                ? null : httpRequest.remoteAddress().hostAddress();
-        recorder.begin(adapter.get(), operation, new AuditRequest(context.getMethod(), body, query, false),
-                        context.getHeaderString(HttpHeaders.AUTHORIZATION), callerIp,
-                        context.getHeaderString(HttpHeaders.USER_AGENT))
-                .ifPresent(call -> context.setProperty(PROPERTY, call));
+        recorder.begin(scope, adapter.get(), operation, new AuditRequest(context.getMethod(), body, query, false));
     }
 
     @Override
     public void filter(ContainerRequestContext request, ContainerResponseContext response) {
-        if (!(request.getProperty(PROPERTY) instanceof AuditLogRecorder.Call call)) {
+        if (!(request.getProperty(PROPERTY) instanceof AuditLogRecorder.Scope scope)) {
             return;
         }
         request.removeProperty(PROPERTY);
         int status = response.getStatus();
         if (status >= 200 && status < 300) {
-            recorder.complete(call, Code.OK_VALUE, null);
+            recorder.complete(scope, Code.OK_VALUE, null);
             return;
         }
         JsonNode error = response.hasEntity() ? errorBody(response.getEntity()) : null;
         String message = error == null ? null : error.path("message").asText(null);
-        recorder.complete(call, code(error == null ? null : error.path("status").asText(null), status), message);
+        recorder.complete(scope, code(error == null ? null : error.path("status").asText(null), status), message);
     }
 
     private JsonNode errorBody(Object entity) {

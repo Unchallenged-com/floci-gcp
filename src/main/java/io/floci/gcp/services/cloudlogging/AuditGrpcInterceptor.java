@@ -12,6 +12,8 @@ import io.floci.gcp.services.iam.authorization.IamAuthorizationRegistry;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.ForwardingServerCallListener.SimpleForwardingServerCallListener;
+import io.grpc.Context;
+import io.grpc.Contexts;
 import io.grpc.Grpc;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
@@ -27,7 +29,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Records the unary gRPC calls that write audit entries. It wraps IAM authorization, so a
@@ -62,31 +63,31 @@ public class AuditGrpcInterceptor implements ServerInterceptor {
         }
         String service = call.getMethodDescriptor().getServiceName();
         String method = call.getMethodDescriptor().getBareMethodName();
-        AtomicReference<AuditLogRecorder.Call> audited = new AtomicReference<>();
+        AuditLogRecorder.Scope scope = new AuditLogRecorder.Scope(headers.get(AUTHORIZATION), callerIp(call),
+                headers.get(USER_AGENT));
         ServerCall<ReqT, RespT> recording = new SimpleForwardingServerCall<>(call) {
             @Override
             public void close(Status status, Metadata trailers) {
-                AuditLogRecorder.Call pending = audited.getAndSet(null);
-                if (pending != null) {
-                    recorder.complete(pending, status.getCode().value(), status.getDescription());
-                }
+                recorder.complete(scope, status.getCode().value(), status.getDescription());
                 super.close(status, trailers);
             }
         };
-        ServerCall.Listener<ReqT> listener = next.startCall(recording, headers);
-        return new SimpleForwardingServerCallListener<>(listener) {
-            @Override
-            public void onMessage(ReqT message) {
-                if (message instanceof Message proto) {
-                    begin(service, method, proto, headers, call).ifPresent(audited::set);
+        Context context = Context.current().withValue(AuditLogRecorder.GRPC_SCOPE, scope);
+        return Contexts.interceptCall(context, recording, headers, (contextCall, contextHeaders) -> {
+            ServerCall.Listener<ReqT> listener = next.startCall(contextCall, contextHeaders);
+            return new SimpleForwardingServerCallListener<>(listener) {
+                @Override
+                public void onMessage(ReqT message) {
+                    if (message instanceof Message proto) {
+                        begin(scope, service, method, proto);
+                    }
+                    super.onMessage(message);
                 }
-                super.onMessage(message);
-            }
-        };
+            };
+        });
     }
 
-    private Optional<AuditLogRecorder.Call> begin(String service, String method, Message request, Metadata headers,
-            ServerCall<?, ?> call) {
+    private void begin(AuditLogRecorder.Scope scope, String service, String method, Message request) {
         try {
             String policyResource = !IAM_POLICY_SERVICE.equals(service) ? null : switch (request) {
                 case SetIamPolicyRequest policy -> policy.getResource();
@@ -97,17 +98,15 @@ public class AuditGrpcInterceptor implements ServerInterceptor {
                     ? (policyResource == null ? Optional.empty() : registry.resource(policyResource))
                     : registry.grpc(service);
             if (adapter.isEmpty()) {
-                return Optional.empty();
+                return;
             }
             IamOperation operation = policyResource != null
                     ? new IamOperation(method, policyResource)
                     : adapter.get().grpcOperation(method, request);
             JsonNode body = mapper.readTree(ProtoJson.print(request));
-            return recorder.begin(adapter.get(), operation, new AuditRequest(method, body, Map.of(), true),
-                    headers.get(AUTHORIZATION), callerIp(call), headers.get(USER_AGENT));
+            recorder.begin(scope, adapter.get(), operation, new AuditRequest(method, body, Map.of(), true));
         } catch (IOException | RuntimeException e) {
             LOG.debugf(e, "No audit mapping for gRPC %s/%s", service, method);
-            return Optional.empty();
         }
     }
 

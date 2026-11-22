@@ -109,4 +109,32 @@ class AuditLogEnforceIntegrationTest {
         assertEquals(caller, audit.getString("authenticationInfo.principalEmail"));
         assertEquals("ERROR", new JsonPath(toJson(entries.getFirst())).getString("severity"));
     }
+
+    @Test
+    void storageReadsRefusedByIamAreRecorded() {
+        String project = project();
+        String bucket = "audit-deny-" + project.substring("audit-".length());
+        given().contentType("application/json").body(Map.of("name", bucket))
+                .when().post("/storage/v1/b?project=" + project).then().statusCode(200);
+        given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("policy", Map.of("auditConfigs", List.of(Map.of("service", "storage.googleapis.com",
+                        "auditLogConfigs", List.of(Map.of("logType", "DATA_READ"))))), "updateMask", "auditConfigs"))
+                .when().post("/v1/projects/" + project + ":setIamPolicy").then().statusCode(200);
+        String caller = "intruder@" + project + ".iam.gserviceaccount.com";
+        String token = tokens.mintImpersonatedToken(caller, Instant.now().plusSeconds(300)).getTokenValue();
+
+        given().header("Authorization", "Bearer " + token).queryParam("alt", "media")
+                .when().get("/storage/v1/b/" + bucket + "/o/q3.csv").then().statusCode(403);
+
+        List<Map<String, Object>> entries = given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("resourceNames", List.of("projects/" + project), "filter",
+                        "logName=\"projects/" + project + "/logs/cloudaudit.googleapis.com%2Fdata_access\""))
+                .when().post("/v2/entries:list").then().statusCode(200).extract().jsonPath().getList("entries");
+        assertEquals(1, entries.size());
+        JsonPath audit = payload(entries.getFirst());
+        assertEquals("storage.objects.get", audit.getString("methodName"));
+        assertEquals(7, audit.getInt("status.code"));
+        assertEquals(caller, audit.getString("authenticationInfo.principalEmail"));
+        assertEquals("ERROR", new JsonPath(toJson(entries.getFirst())).getString("severity"));
+    }
 }

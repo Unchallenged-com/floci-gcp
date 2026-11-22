@@ -1,6 +1,7 @@
 package io.floci.gcp.services.cloudlogging;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.PageToken;
@@ -11,9 +12,14 @@ import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
 import io.floci.gcp.lifecycle.GrpcServerManager;
 import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
+import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditTrail;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
+import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -40,16 +46,18 @@ public class CloudLoggingService {
     private final GrpcServerManager grpcServerManager;
     private final CloudLoggingSinkService sinkService;
     private final CloudLoggingMetricService metricService;
+    private final Instance<AuditTrail> auditTrail;
 
     @Inject
     public CloudLoggingService(ServiceRegistry serviceRegistry, EmulatorConfig config,
             StorageFactory storageFactory, GrpcServerManager grpcServerManager, CloudLoggingSinkService sinkService,
-            CloudLoggingMetricService metricService) {
+            CloudLoggingMetricService metricService, Instance<AuditTrail> auditTrail) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.sinkService = sinkService;
         this.metricService = metricService;
+        this.auditTrail = auditTrail;
         this.entryStore = storageFactory.createGlobal("cloudlogging-entries", "cloudlogging-entries.json",
                 new TypeReference<Map<String, StoredLogEntry>>() {});
     }
@@ -61,6 +69,7 @@ public class CloudLoggingService {
         this.grpcServerManager = null;
         this.sinkService = null;
         this.metricService = null;
+        this.auditTrail = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -137,6 +146,7 @@ public class CloudLoggingService {
 
     public PageToken.Page<StoredLogEntry> listLogEntries(List<String> resourceNames, String filter,
             String orderBy, int pageSize, String pageToken) {
+        audit(resourceNames, filter, orderBy, pageSize, pageToken);
         if (resourceNames == null || resourceNames.isEmpty()) {
             throw GcpException.invalidArgument("ListLogEntries requires at least one resource name");
         }
@@ -157,6 +167,46 @@ public class CloudLoggingService {
                 .collect(Collectors.toList());
 
         return PageToken.paginate(matched, pageSize, pageToken);
+    }
+
+    /**
+     * ListLogEntries is a Data Access (DATA_READ) method of https://docs.cloud.google.com/logging/docs/audit-logging,
+     * recorded once per project it reads, before the call runs so a refused or invalid call is recorded too. The
+     * entry names an {@code audited_resource}, the monitored resource "A Google Cloud resource that produces an
+     * audit log" (https://docs.cloud.google.com/logging/docs/api/v2/resource-list).
+     */
+    private void audit(List<String> resourceNames, String filter, String orderBy, int pageSize, String pageToken) {
+        if (auditTrail == null || !auditTrail.isResolvable() || resourceNames == null) {
+            return;
+        }
+        String method = "google.logging.v2.LoggingServiceV2.ListLogEntries";
+        for (String resource : resourceNames) {
+            if (resource == null || !resource.matches("projects/[^/]+")) {
+                continue;
+            }
+            Map<String, Object> request = new LinkedHashMap<>();
+            request.put("@type", "type.googleapis.com/google.logging.v2.ListLogEntriesRequest");
+            request.put("resourceNames", List.copyOf(resourceNames));
+            if (filter != null && !filter.isEmpty()) {
+                request.put("filter", filter);
+            }
+            if (orderBy != null && !orderBy.isEmpty()) {
+                request.put("orderBy", orderBy);
+            }
+            if (pageSize != 0) {
+                request.put("pageSize", pageSize);
+            }
+            if (pageToken != null && !pageToken.isEmpty()) {
+                request.put("pageToken", pageToken);
+            }
+            Map<String, String> labels = new LinkedHashMap<>();
+            labels.put("method", method);
+            labels.put("project_id", resource.substring("projects/".length()));
+            labels.put("service", "logging.googleapis.com");
+            auditTrail.get().record(new AuditedMethod("logging.googleapis.com", method, resource, resource,
+                    "audited_resource", labels, request, null, PermissionType.DATA_READ),
+                    List.of(new IamPermissionCheck("logging.logEntries.list", IamResource.project(resource))));
+        }
     }
 
     public List<String> listLogs(String parent) {
