@@ -1,12 +1,16 @@
 package io.floci.gcp.services.cloudrun;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -60,6 +64,56 @@ public class CloudRunIamAuthorizationAdapter implements IamAuthorizationAdapter 
     @Override
     public IamOperation grpcOperation(String method, JsonNode request) {
         throw unsupported("gRPC operation " + method);
+    }
+
+    /**
+     * Service changes, IAM policy changes and revision deletion, Admin Activity methods of
+     * https://docs.cloud.google.com/run/docs/audit-logging ({@code google.cloud.run.v2.Services.*},
+     * {@code google.cloud.run.v2.Revisions.DeleteRevision}), on a {@code cloud_run_revision} resource, the Cloud
+     * Run type of the resource list that names a service ({@code project_id}, {@code service_name},
+     * {@code revision_name}, {@code location}).
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        String interfaceName = switch (operation.name()) {
+            case "CreateService", "UpdateService", "DeleteService", "SetIamPolicy" -> "Services";
+            case "DeleteRevision" -> "Revisions";
+            default -> null;
+        };
+        if (interfaceName == null) {
+            return Optional.empty();
+        }
+        String name = "CreateService".equals(operation.name())
+                ? operation.resource() + "/services/" + request.query().getOrDefault("serviceId", "")
+                : operation.resource();
+        String[] parts = name.split("/");
+        if (parts.length < 6) {
+            return Optional.empty();
+        }
+        Map<String, Object> audited = AuditedMethod.request(
+                "google.cloud.run.v2." + operation.name() + "Request", null);
+        switch (operation.name()) {
+            case "CreateService" -> {
+                audited.put("parent", operation.resource());
+                audited.put("serviceId", request.query().getOrDefault("serviceId", ""));
+                audited.put("service", AuditedMethod.value(request.body()));
+            }
+            case "UpdateService" -> audited.put("service", AuditedMethod.value(request.body()));
+            case "SetIamPolicy" -> {
+                audited.put("resource", name);
+                audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+            }
+            default -> audited.put("name", name);
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("project_id", parts[1]);
+        labels.put("service_name", parts[5]);
+        labels.put("revision_name", parts.length > 7 ? parts[7] : "");
+        labels.put("location", parts[3]);
+        return Optional.of(new AuditedMethod("run.googleapis.com",
+                "google.cloud.run.v2." + interfaceName + "." + operation.name(), name, "projects/" + parts[1],
+                "cloud_run_revision", labels, audited, "SetIamPolicy".equals(operation.name()) ? name : null,
+                PermissionType.ADMIN_WRITE));
     }
 
     @Override
