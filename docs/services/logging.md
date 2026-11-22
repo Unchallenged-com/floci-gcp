@@ -488,6 +488,7 @@ and counted by log-based metrics like any other entry.
 | IAM (`iam.googleapis.com`) | `google.iam.admin.v1.` `CreateServiceAccount`, `PatchServiceAccount`, `UpdateServiceAccount`, `DeleteServiceAccount`, `DisableServiceAccount`, `EnableServiceAccount`, `CreateServiceAccountKey`, `DeleteServiceAccountKey`, `SetIAMPolicy` | `service_account` (`email_id`, `project_id`, `unique_id`) |
 | Resource Manager (`cloudresourcemanager.googleapis.com`) | `SetIamPolicy` on a project, over REST and the IAM policy gRPC mixin | `project` (`project_id`) |
 | Cloud Logging (`logging.googleapis.com`) | `google.logging.v2.ConfigServiceV2.` `CreateSink`, `UpdateSink`, `DeleteSink` for project sinks, over REST and gRPC | `logging_sink` (`project_id`, `destination` empty, `name`) |
+| Cloud KMS (`cloudkms.googleapis.com`) | `CreateKeyRing`, `CreateCryptoKey`, `UpdateCryptoKey`, `UpdateCryptoKeyPrimaryVersion`, `CreateCryptoKeyVersion`, `UpdateCryptoKeyVersion`, `DestroyCryptoKeyVersion`, `RestoreCryptoKeyVersion`, `CreateImportJob`, `ImportCryptoKeyVersion`, over REST and gRPC; no key material is recorded | `cloudkms_keyring`, `cloudkms_cryptokey`, `cloudkms_cryptokeyversion`; `audited_resource` for import jobs |
 
 Each entry carries `serviceName`, `methodName`, `resourceName`, `status` (`{}` on success, the call's
 code and message otherwise), `authenticationInfo` (`principalEmail` and `principalSubject` of a

@@ -514,7 +514,9 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
             }
             return;
         }
-        context.executeBlocking(work, false).onComplete(result -> {
+        // The worker thread keeps the call's gRPC context (io.grpc.Context, qualified as Vert.x's Context is
+        // imported), so request-scoped state such as the call's audit scope reaches the service.
+        context.executeBlocking(io.grpc.Context.current().wrap(work), false).onComplete(result -> {
             if (result.succeeded()) {
                 responseObserver.onNext(result.result());
                 responseObserver.onCompleted();

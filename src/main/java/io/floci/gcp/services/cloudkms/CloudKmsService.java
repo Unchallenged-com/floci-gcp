@@ -15,9 +15,14 @@ import io.floci.gcp.services.cloudkms.model.StoredCryptoKey;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKeyVersion;
 import io.floci.gcp.services.cloudkms.model.StoredImportJob;
 import io.floci.gcp.services.cloudkms.model.StoredKeyRing;
+import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditTrail;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
+import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -33,10 +38,16 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class CloudKmsService {
 
+    private static final String KMS_SERVICE = "cloudkms.googleapis.com";
+    private static final Pattern KMS_NAME = Pattern.compile(
+            "projects/([^/]+)/locations/([^/]+)/keyRings/([^/]+)(?:/importJobs/([^/]+)|"
+                    + "(?:/cryptoKeys/([^/]+)(?:/cryptoKeyVersions/([^/]+))?))?");
     private static final Logger LOG = Logger.getLogger(CloudKmsService.class);
     private static final int LOCK_STRIPES = 256;
     private final Object[] locks = createLocks();
@@ -61,11 +72,14 @@ public class CloudKmsService {
     private final EmulatorConfig config;
     private final GrpcServerManager grpcServerManager;
     private final LocationCatalog locations;
+    private final Instance<AuditTrail> auditTrail;
 
     @Inject
     public CloudKmsService(ServiceRegistry serviceRegistry, EmulatorConfig config,
-            StorageFactory storageFactory, GrpcServerManager grpcServerManager, LocationCatalog locations) {
+            StorageFactory storageFactory, GrpcServerManager grpcServerManager, LocationCatalog locations,
+            Instance<AuditTrail> auditTrail) {
         this.serviceRegistry = serviceRegistry;
+        this.auditTrail = auditTrail;
         this.locations = locations;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
@@ -91,6 +105,7 @@ public class CloudKmsService {
         this.config = null;
         this.grpcServerManager = null;
         this.locations = LocationCatalog.lenient();
+        this.auditTrail = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -105,9 +120,67 @@ public class CloudKmsService {
         grpcServerManager.bind(new CloudKmsController(this));
     }
 
+    /**
+     * Records an Admin Activity (ADMIN_WRITE) method of https://docs.cloud.google.com/kms/docs/audit-logging, with
+     * the permission that page lists for it, on the KMS monitored resource of the object it names
+     * ({@code cloudkms_keyring}, {@code cloudkms_cryptokey} or {@code cloudkms_cryptokeyversion},
+     * https://docs.cloud.google.com/logging/docs/api/v2/resource-list; {@code audited_resource} for import jobs).
+     */
+    private void audit(String method, String permission, String resource, Map<String, Object> fields) {
+        if (auditTrail == null || !auditTrail.isResolvable() || resource == null) {
+            return;
+        }
+        Matcher name = KMS_NAME.matcher(resource);
+        if (!name.matches()) {
+            return;
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        String type;
+        if (name.group(4) != null) {
+            type = "audited_resource";
+            labels.put("method", method);
+            labels.put("project_id", name.group(1));
+            labels.put("service", KMS_SERVICE);
+        } else {
+            labels.put("project_id", name.group(1));
+            labels.put("location", name.group(2));
+            labels.put("key_ring_id", name.group(3));
+            type = "cloudkms_keyring";
+            if (name.group(5) != null) {
+                labels.put("crypto_key_id", name.group(5));
+                type = "cloudkms_cryptokey";
+            }
+            if (name.group(6) != null) {
+                labels.put("crypto_key_version_id", name.group(6));
+                type = "cloudkms_cryptokeyversion";
+            }
+        }
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("@type", "type.googleapis.com/google.cloud.kms.v1." + method + "Request");
+        request.putAll(fields);
+        String project = "projects/" + name.group(1);
+        auditTrail.get().record(new AuditedMethod(KMS_SERVICE, method, resource, project, type, labels, request, null),
+                List.of(new IamPermissionCheck(permission, new IamResource(KMS_SERVICE, KMS_SERVICE + "/"
+                        + (name.group(6) != null ? "CryptoKeyVersion" : name.group(5) != null ? "CryptoKey"
+                                : name.group(4) != null ? "ImportJob" : "KeyRing"), resource, resource, project))));
+    }
+
+    /** Request fields for an audit entry, without the absent ones. */
+    private static Map<String, Object> fields(Object... keysAndValues) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < keysAndValues.length; i += 2) {
+            if (keysAndValues[i + 1] != null) {
+                fields.put(String.valueOf(keysAndValues[i]), keysAndValues[i + 1]);
+            }
+        }
+        return fields;
+    }
+
     // ── KeyRings ─────────────────────────────────────────────────────────────
 
     public StoredKeyRing createKeyRing(String parent, String keyRingId) {
+        audit("CreateKeyRing", "cloudkms.keyRings.create", parent + "/keyRings/" + keyRingId,
+                fields("parent", parent, "keyRingId", keyRingId));
         requireKmsLocation(parent);
         String name = parent + "/keyRings/" + keyRingId;
         LOG.infof("createKeyRing name=%s", name);
@@ -154,6 +227,8 @@ public class CloudKmsService {
 
     public StoredCryptoKey createCryptoKey(String parent, String cryptoKeyId, String purpose,
             String algorithm, boolean skipInitialVersionCreation, CryptoKeyFields fields, boolean importOnly) {
+        audit("CreateCryptoKey", "cloudkms.cryptoKeys.create", parent + "/cryptoKeys/" + cryptoKeyId,
+                fields("parent", parent, "cryptoKeyId", cryptoKeyId));
         getKeyRing(parent); // validates the parent key ring exists
         if (importOnly && !skipInitialVersionCreation) {
             throw GcpException.invalidArgument(
@@ -178,7 +253,7 @@ public class CloudKmsService {
             }
             cryptoKeyStore.put(name, key);
             if (!skipInitialVersionCreation) {
-                StoredCryptoKeyVersion version = createCryptoKeyVersion(name);
+                StoredCryptoKeyVersion version = newCryptoKeyVersion(name);
                 if ("ENCRYPT_DECRYPT".equals(purpose)) {
                     key.setPrimaryVersion(version.getVersionNumber());
                     cryptoKeyStore.put(name, key);
@@ -206,6 +281,8 @@ public class CloudKmsService {
      */
     public StoredCryptoKey updateCryptoKey(String name, CryptoKeyFields fields, String versionTemplateAlgorithm,
             Set<String> paths) {
+        audit("UpdateCryptoKey", "cloudkms.cryptoKeys.update", name, fields("cryptoKey", fields("name", name),
+                "updateMask", paths == null ? null : String.join(",", paths)));
         synchronized (lock(name)) {
             return applyCryptoKeyUpdate(name, fields, versionTemplateAlgorithm, paths);
         }
@@ -301,6 +378,8 @@ public class CloudKmsService {
     }
 
     public StoredCryptoKey updateCryptoKeyPrimaryVersion(String name, String cryptoKeyVersionId) {
+        audit("UpdateCryptoKeyPrimaryVersion", "cloudkms.cryptoKeys.update", name,
+                fields("name", name, "cryptoKeyVersionId", cryptoKeyVersionId));
         synchronized (lock(name)) {
             StoredCryptoKey key = getCryptoKey(name);
             String versionName = name + "/cryptoKeyVersions/" + cryptoKeyVersionId;
@@ -315,6 +394,13 @@ public class CloudKmsService {
     // ── CryptoKeyVersions ────────────────────────────────────────────────────
 
     public StoredCryptoKeyVersion createCryptoKeyVersion(String cryptoKeyName) {
+        audit("CreateCryptoKeyVersion", "cloudkms.cryptoKeyVersions.create", cryptoKeyName,
+                fields("parent", cryptoKeyName));
+        return newCryptoKeyVersion(cryptoKeyName);
+    }
+
+    /** A key's next version, also created with the key itself, which records only CreateCryptoKey. */
+    private StoredCryptoKeyVersion newCryptoKeyVersion(String cryptoKeyName) {
         synchronized (lock(cryptoKeyName)) {
             StoredCryptoKey key = getCryptoKey(cryptoKeyName);
             if (key.isImportOnly()) {
@@ -351,6 +437,8 @@ public class CloudKmsService {
     }
 
     public StoredCryptoKeyVersion updateCryptoKeyVersionState(String name, String state) {
+        audit("UpdateCryptoKeyVersion", "cloudkms.cryptoKeyVersions.update", name,
+                fields("cryptoKeyVersion", fields("name", name, "state", String.valueOf(state)), "updateMask", "state"));
         StoredCryptoKeyVersion version = getCryptoKeyVersion(name);
         requireKeyMaterial(version);
         if (!"ENABLED".equals(state) && !"DISABLED".equals(state)) {
@@ -362,6 +450,7 @@ public class CloudKmsService {
     }
 
     public StoredCryptoKeyVersion destroyCryptoKeyVersion(String name) {
+        audit("DestroyCryptoKeyVersion", "cloudkms.cryptoKeyVersions.destroy", name, fields("name", name));
         StoredCryptoKeyVersion version = getCryptoKeyVersion(name);
         requireKeyMaterial(version);
         version.setState("DESTROY_SCHEDULED");
@@ -371,6 +460,7 @@ public class CloudKmsService {
     }
 
     public StoredCryptoKeyVersion restoreCryptoKeyVersion(String name) {
+        audit("RestoreCryptoKeyVersion", "cloudkms.cryptoKeyVersions.restore", name, fields("name", name));
         StoredCryptoKeyVersion version = getCryptoKeyVersion(name);
         if (!"DESTROY_SCHEDULED".equals(version.getState())) {
             throw GcpException.failedPrecondition("CryptoKeyVersion is not scheduled for destruction: " + name);
@@ -385,6 +475,8 @@ public class CloudKmsService {
 
     public StoredImportJob createImportJob(String parent, String importJobId, String importMethod,
             String protectionLevel) {
+        audit("CreateImportJob", "cloudkms.importJobs.create", parent + "/importJobs/" + importJobId,
+                fields("parent", parent, "importJobId", importJobId));
         getKeyRing(parent);
         String name = parent + "/importJobs/" + importJobId;
         LOG.infof("createImportJob name=%s importMethod=%s", name, importMethod);
@@ -432,6 +524,9 @@ public class CloudKmsService {
      */
     public StoredCryptoKeyVersion importCryptoKeyVersion(String cryptoKeyName, String algorithm,
             String importJobName, byte[] wrappedKey) {
+        // The wrapped key material is never recorded.
+        audit("ImportCryptoKeyVersion", "cloudkms.cryptoKeyVersions.create", cryptoKeyName,
+                fields("parent", cryptoKeyName, "importJob", String.valueOf(importJobName)));
         StoredCryptoKey key = getCryptoKey(cryptoKeyName);
         if (algorithm == null || algorithm.isBlank() || "CRYPTO_KEY_VERSION_ALGORITHM_UNSPECIFIED".equals(algorithm)) {
             throw GcpException.invalidArgument("algorithm is required");
