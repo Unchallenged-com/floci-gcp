@@ -118,14 +118,17 @@ public class SecretManagerIamAuthorizationAdapter implements IamAuthorizationAda
     }
 
     /**
-     * The Data Access methods of https://docs.cloud.google.com/secret-manager/docs/audit-logging, with their
-     * permission types: AccessSecretVersion is DATA_READ, the metadata reads ADMIN_READ. Entries name an
+     * The audited methods of https://docs.cloud.google.com/secret-manager/docs/audit-logging, with their
+     * permission types: secret and version changes and SetIamPolicy are ADMIN_WRITE (Admin Activity),
+     * AccessSecretVersion is DATA_READ and the metadata reads ADMIN_READ (Data Access). Entries name an
      * {@code audited_resource} with {@code method}, {@code project_id} and {@code service}, as captured
-     * AccessSecretVersion entries do; the secret payload is never recorded.
+     * entries do; secret payloads are never recorded.
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
         PermissionType permissionType = switch (operation.name()) {
+            case "CreateSecret", "UpdateSecret", "DeleteSecret", "AddSecretVersion", "EnableSecretVersion",
+                    "DisableSecretVersion", "DestroySecretVersion", "SetIamPolicy" -> PermissionType.ADMIN_WRITE;
             case "AccessSecretVersion" -> PermissionType.DATA_READ;
             case "GetSecret", "GetSecretVersion", "ListSecrets", "ListSecretVersions", "GetIamPolicy" ->
                     PermissionType.ADMIN_READ;
@@ -136,19 +139,42 @@ public class SecretManagerIamAuthorizationAdapter implements IamAuthorizationAda
         }
         String project = operation.resource().split("/")[1];
         String methodName = "google.cloud.secretmanager.v1.SecretManagerService." + operation.name();
+        String resourceName = operation.resource();
         Map<String, Object> audited = AuditedMethod.request(
                 "google.cloud.secretmanager.v1." + operation.name() + "Request", null);
-        audited.put(switch (operation.name()) {
-            case "ListSecrets", "ListSecretVersions" -> "parent";
-            case "GetIamPolicy" -> "resource";
-            default -> "name";
-        }, operation.resource());
+        switch (operation.name()) {
+            case "CreateSecret" -> {
+                String secretId = request.grpc() ? request.body().path("secretId").asText("")
+                        : request.query().getOrDefault("secretId", "");
+                audited.put("parent", operation.resource());
+                audited.put("secretId", secretId);
+                audited.put("secret", AuditedMethod.value(request.grpc() ? request.body().path("secret") : request.body()));
+                resourceName = operation.resource() + "/secrets/" + secretId;
+            }
+            case "UpdateSecret" -> {
+                audited.put("secret", AuditedMethod.value(request.grpc() ? request.body().path("secret") : request.body()));
+                Object mask = request.grpc() ? AuditedMethod.value(request.body().path("updateMask"))
+                        : request.query().get("updateMask");
+                if (mask != null) {
+                    audited.put("updateMask", mask);
+                }
+            }
+            // The version's payload is the secret itself: only its parent is recorded.
+            case "ListSecrets", "ListSecretVersions", "AddSecretVersion" -> audited.put("parent", operation.resource());
+            case "GetIamPolicy" -> audited.put("resource", operation.resource());
+            case "SetIamPolicy" -> {
+                audited.put("resource", operation.resource());
+                audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+            }
+            default -> audited.put("name", operation.resource());
+        }
         Map<String, String> labels = new LinkedHashMap<>();
         labels.put("method", methodName);
         labels.put("project_id", project);
         labels.put("service", SERVICE);
-        return Optional.of(new AuditedMethod(SERVICE, methodName, operation.resource(), "projects/" + project,
-                "audited_resource", labels, audited, null, permissionType));
+        return Optional.of(new AuditedMethod(SERVICE, methodName, resourceName, "projects/" + project,
+                "audited_resource", labels, audited, "SetIamPolicy".equals(operation.name()) ? operation.resource() : null,
+                permissionType));
     }
 
     @Override
