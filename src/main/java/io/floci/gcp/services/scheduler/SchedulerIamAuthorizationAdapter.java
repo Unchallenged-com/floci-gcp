@@ -1,6 +1,7 @@
 package io.floci.gcp.services.scheduler;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.cloud.scheduler.v1.CreateJobRequest;
 import com.google.cloud.scheduler.v1.DeleteJobRequest;
 import com.google.cloud.scheduler.v1.GetJobRequest;
@@ -13,11 +14,14 @@ import com.google.cloud.scheduler.v1.UpdateJobRequest;
 import com.google.protobuf.Message;
 import io.floci.gcp.core.common.ProtoJson;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -140,6 +144,50 @@ public class SchedulerIamAuthorizationAdapter implements IamAuthorizationAdapter
     @Override
     public Map<String, Set<String>> basicRoles() {
         return Map.of("roles/owner", ADMIN, "roles/editor", ADMIN, "roles/viewer", VIEWER);
+    }
+
+    /**
+     * Job changes, the Admin Activity methods of https://docs.cloud.google.com/scheduler/docs/audit-logging
+     * ({@code google.cloud.scheduler.v1.CloudScheduler.*}), on a {@code cloud_scheduler_job} resource
+     * ({@code project_id}, {@code location}, {@code job_id}: resource list).
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (!Set.of("CreateJob", "UpdateJob", "DeleteJob", "PauseJob", "ResumeJob", "RunJob").contains(operation.name())) {
+            return Optional.empty();
+        }
+        boolean create = "CreateJob".equals(operation.name());
+        String jobName = operation.resource();
+        if (create) {
+            String named = request.grpc() ? request.body().path("job").path("name").asText("")
+                    : request.body().path("name").asText("");
+            jobName = named.isEmpty() ? operation.resource() : named;
+        }
+        String[] parts = jobName.split("/");
+        if (parts.length < 4 || !"projects".equals(parts[0])) {
+            return Optional.empty();
+        }
+        Map<String, Object> audited;
+        if (request.grpc()) {
+            audited = AuditedMethod.request("google.cloud.scheduler.v1." + operation.name() + "Request", request.body());
+        } else {
+            audited = AuditedMethod.request("google.cloud.scheduler.v1." + operation.name() + "Request", null);
+            switch (operation.name()) {
+                case "CreateJob" -> {
+                    audited.put("parent", operation.resource());
+                    audited.put("job", AuditedMethod.value(request.body()));
+                }
+                case "UpdateJob" -> audited.put("job", AuditedMethod.value(request.body()));
+                default -> audited.put("name", jobName);
+            }
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("project_id", parts[1]);
+        labels.put("location", parts[3]);
+        labels.put("job_id", parts.length > 5 ? parts[5] : "");
+        return Optional.of(new AuditedMethod("cloudscheduler.googleapis.com",
+                "google.cloud.scheduler.v1.CloudScheduler." + operation.name(), jobName, "projects/" + parts[1],
+                "cloud_scheduler_job", labels, audited, null, PermissionType.ADMIN_WRITE));
     }
 
     private static IamOperation jobOperation(String method, String target, Job job) {

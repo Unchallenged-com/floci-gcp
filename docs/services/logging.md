@@ -488,6 +488,7 @@ and counted by log-based metrics like any other entry.
 | IAM (`iam.googleapis.com`) | `google.iam.admin.v1.` `CreateServiceAccount`, `PatchServiceAccount`, `UpdateServiceAccount`, `DeleteServiceAccount`, `DisableServiceAccount`, `EnableServiceAccount`, `CreateServiceAccountKey`, `DeleteServiceAccountKey`, `SetIAMPolicy` | `service_account` (`email_id`, `project_id`, `unique_id`) |
 | Resource Manager (`cloudresourcemanager.googleapis.com`) | `SetIamPolicy` on a project, over REST and the IAM policy gRPC mixin | `project` (`project_id`) |
 | Cloud Logging (`logging.googleapis.com`) | `google.logging.v2.ConfigServiceV2.` `CreateSink`, `UpdateSink`, `DeleteSink` for project sinks, over REST and gRPC | `logging_sink` (`project_id`, `destination` empty, `name`) |
+| Cloud Scheduler (`cloudscheduler.googleapis.com`) | `google.cloud.scheduler.v1.CloudScheduler.` `CreateJob`, `UpdateJob`, `DeleteJob`, `PauseJob`, `ResumeJob`, `RunJob`, over REST and gRPC | `cloud_scheduler_job` (`project_id`, `location`, `job_id`) |
 
 Each entry carries `serviceName`, `methodName`, `resourceName`, `status` (`{}` on success, the call's
 code and message otherwise), `authenticationInfo` (`principalEmail` and `principalSubject` of a
