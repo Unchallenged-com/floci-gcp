@@ -209,6 +209,29 @@ public class CloudLoggingService {
         }
     }
 
+    /**
+     * DeleteLog is an Admin Activity method of https://docs.cloud.google.com/logging/docs/audit-logging, recorded on
+     * a {@code logging_log} resource ({@code project_id}, {@code name}: "A Google Cloud Logging log",
+     * https://docs.cloud.google.com/logging/docs/api/v2/resource-list).
+     */
+    private void auditDeleteLog(String logName) {
+        if (auditTrail == null || !auditTrail.isResolvable() || logName == null
+                || !logName.matches("projects/[^/]+/logs/[^/]+")) {
+            return;
+        }
+        String[] parts = logName.split("/");
+        String project = "projects/" + parts[1];
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("name", parts[3]);
+        labels.put("project_id", parts[1]);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("@type", "type.googleapis.com/google.logging.v2.DeleteLogRequest");
+        request.put("logName", logName);
+        auditTrail.get().record(new AuditedMethod("logging.googleapis.com", "google.logging.v2.LoggingServiceV2.DeleteLog",
+                logName, project, "logging_log", labels, request, null, PermissionType.ADMIN_WRITE),
+                List.of(new IamPermissionCheck("logging.logs.delete", IamResource.project(project))));
+    }
+
     public List<String> listLogs(String parent) {
         String prefix = parent + "/logs/";
         return entryStore.scan(k -> true).stream()
@@ -220,6 +243,7 @@ public class CloudLoggingService {
     }
 
     public void deleteLog(String logName) {
+        auditDeleteLog(logName);
         List<StoredLogEntry> entries = entryStore.scan(k -> true).stream()
                 .filter(e -> logName.equals(e.getLogName()))
                 .collect(Collectors.toList());

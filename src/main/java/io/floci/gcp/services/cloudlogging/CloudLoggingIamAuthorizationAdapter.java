@@ -93,12 +93,15 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (Set.of("CreateLogMetric", "UpdateLogMetric", "DeleteLogMetric").contains(operation.name())) {
+            return metricAuditedMethod(operation, request);
+        }
         if (!Set.of("CreateSink", "UpdateSink", "DeleteSink", "GetSink").contains(operation.name())
-                || !operation.resource().matches("projects/[^/]+/sinks/[^/]+")) {
+                || !operation.resource().matches("(projects|organizations|folders|billingAccounts)/[^/]+/sinks/[^/]+")) {
             return Optional.empty();
         }
         String[] parts = operation.resource().split("/");
-        String parent = "projects/" + parts[1];
+        String parent = parts[0] + "/" + parts[1];
         Map<String, Object> audited;
         if (request.grpc()) {
             audited = AuditedMethod.request("google.logging.v2." + operation.name() + "Request", request.body());
@@ -119,13 +122,52 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
                 }
             }
         }
+        // logging_sink has project_id, name and destination labels; a sink outside a project has no project_id.
         Map<String, String> labels = new LinkedHashMap<>();
-        labels.put("project_id", parts[1]);
+        if ("projects".equals(parts[0])) {
+            labels.put("project_id", parts[1]);
+        }
         labels.put("destination", "");
         labels.put("name", parts[3]);
         return Optional.of(new AuditedMethod("logging.googleapis.com", "google.logging.v2.ConfigServiceV2."
                 + operation.name(), operation.resource(), parent, "logging_sink", labels, audited, null,
                 "GetSink".equals(operation.name()) ? PermissionType.ADMIN_READ : PermissionType.ADMIN_WRITE));
+    }
+
+    /**
+     * Log-based metric changes, Admin Activity methods of https://docs.cloud.google.com/logging/docs/audit-logging,
+     * as a captured CreateLogMetric entry records them: a {@code metric} resource named after the metric type
+     * ({@code logging.googleapis.com/user/{name}}) and the RPC request.
+     */
+    private Optional<AuditedMethod> metricAuditedMethod(IamOperation operation, AuditRequest request) {
+        if (!operation.resource().matches("projects/[^/]+/metrics/.+")) {
+            return Optional.empty();
+        }
+        String[] parts = operation.resource().split("/", 4);
+        String parent = "projects/" + parts[1];
+        Map<String, Object> audited;
+        if (request.grpc()) {
+            audited = AuditedMethod.request("google.logging.v2." + operation.name() + "Request", request.body());
+        } else {
+            audited = AuditedMethod.request("google.logging.v2." + operation.name() + "Request", null);
+            switch (operation.name()) {
+                case "CreateLogMetric" -> {
+                    audited.put("parent", parent);
+                    audited.put("metric", AuditedMethod.value(request.body()));
+                }
+                case "UpdateLogMetric" -> {
+                    audited.put("metricName", operation.resource());
+                    audited.put("metric", AuditedMethod.value(request.body()));
+                }
+                default -> audited.put("metricName", operation.resource());
+            }
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("name", "logging.googleapis.com/user/" + parts[3]);
+        labels.put("project_id", parts[1]);
+        return Optional.of(new AuditedMethod("logging.googleapis.com", "google.logging.v2.MetricsServiceV2."
+                + operation.name(), operation.resource(), parent, "metric", labels, audited, null,
+                PermissionType.ADMIN_WRITE));
     }
 
     @Override
