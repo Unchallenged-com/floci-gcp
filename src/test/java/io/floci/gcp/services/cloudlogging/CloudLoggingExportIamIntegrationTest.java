@@ -47,6 +47,8 @@ class CloudLoggingExportIamIntegrationTest {
         String callerEmail = "logging-caller@example.test";
         String caller = "Bearer " + tokens.mintImpersonatedToken(callerEmail, Instant.now().plusSeconds(600)).getTokenValue();
         try {
+            // In enforce mode the caller needs logging.logEntries.create on the source project to write at all.
+            iam.setPolicy(parent, grant("serviceAccount:" + callerEmail, "roles/logging.logWriter"));
             iam.setPolicy("buckets/" + bucket, grant("serviceAccount:" + callerEmail, "roles/storage.objectCreator"));
             write(log, caller);
             assertTrue(storage.listObjects(bucket).isEmpty(), "The logging caller's bucket grant must not grant export access");
@@ -57,7 +59,11 @@ class CloudLoggingExportIamIntegrationTest {
             write(log, caller);
             assertTrue(storage.listObjects(bucket).isEmpty());
             iam.setPolicy("buckets/" + bucket, new StoredPolicy());
-            iam.setPolicy(parent, grant(writer, "roles/storage.objectCreator"));
+            StoredPolicy sourceGrants = new StoredPolicy();
+            sourceGrants.setBindings(List.of(
+                    Map.of("role", "roles/logging.logWriter", "members", List.of("serviceAccount:" + callerEmail)),
+                    Map.of("role", "roles/storage.objectCreator", "members", List.of(writer))));
+            iam.setPolicy(parent, sourceGrants);
             write(log, caller);
             assertTrue(storage.listObjects(bucket).isEmpty(), "The source project grant must not authorize another project's bucket");
             iam.setPolicy("projects/export-destination", grant(writer, "roles/storage.objectCreator"));

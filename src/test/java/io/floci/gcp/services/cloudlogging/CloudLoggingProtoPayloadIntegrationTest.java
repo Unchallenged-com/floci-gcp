@@ -66,7 +66,7 @@ class CloudLoggingProtoPayloadIntegrationTest {
     void setUp() {
         channel = ManagedChannelBuilder.forAddress(endpoint.getHost(), endpoint.getPort()).usePlaintext().build();
         logging = LoggingServiceV2Grpc.newBlockingStub(channel);
-        log = PARENT + "/logs/cloudaudit.googleapis.com%2Factivity-" + UUID.randomUUID();
+        log = PARENT + "/logs/audit-proto-" + UUID.randomUUID();
     }
 
     @AfterEach

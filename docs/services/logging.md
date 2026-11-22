@@ -504,6 +504,21 @@ Method names and their log type follow the [IAM](https://docs.cloud.google.com/i
 [Cloud Logging](https://docs.cloud.google.com/logging/docs/audit-logging) audit logging pages; field
 shapes follow `google/cloud/audit/audit_log.proto` and entries captured from Google Cloud.
 
+### Protecting audit logs
+
+- Only the emulator's audit recorder writes to `cloudaudit.googleapis.com` logs: an `entries.write` or
+  `WriteLogEntries` naming one fails with `INVALID_ARGUMENT`.
+- `DeleteLog` "Deletes all the log entries in a log for the global _Default Log Bucket"
+  ([logs.delete](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/projects.logs/delete)); the logs the
+  `_Required` sink routes (`cloudaudit.googleapis.com/activity`, `system_event`, `access_transparency`, and their
+  `externalaudit.googleapis.com` twins) cannot be deleted and fail with `INVALID_ARGUMENT`. Data Access logs can.
+- In `enforce` mode, evaluated callers need `logging.logEntries.create` (write), `logging.logEntries.list` (list),
+  `logging.logs.list` and `logging.logs.delete` on the project, from `roles/logging.logWriter`, `roles/logging.viewer`,
+  `roles/logging.privateLogViewer` and `roles/logging.admin`
+  ([Logging roles](https://docs.cloud.google.com/iam/docs/roles-permissions/logging)). Data Access entries are listed
+  only to callers with `logging.privateLogEntries.list`, as Logs Viewer "cannot view Data Access audit logs that are
+  in the _Default bucket". Entry methods outside a project fail closed for evaluated callers.
+
 ### Data Access
 
 Data Access entries go to `{parent}/logs/cloudaudit.googleapis.com%2Fdata_access`, only when the

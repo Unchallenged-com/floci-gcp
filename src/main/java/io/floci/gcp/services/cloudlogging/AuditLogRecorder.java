@@ -169,7 +169,7 @@ public class AuditLogRecorder implements AuditTrail {
             if (!isAdminActivity(call.method()) && !dataAccessEnabled(call.method(), call.principal())) {
                 return;
             }
-            logging.get().writeLogEntries(null, null, null, null, List.of(entry(call, code, message)), false);
+            logging.get().writeAuditEntries(List.of(entry(call, code, message)));
         } catch (RuntimeException e) {
             LOG.warnf(e, "Failed to write the audit entry for %s on %s",
                     call.method().methodName(), call.method().resourceName());

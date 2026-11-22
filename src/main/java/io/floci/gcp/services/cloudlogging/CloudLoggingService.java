@@ -15,6 +15,7 @@ import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
 import io.floci.gcp.services.iam.IamResource;
 import io.floci.gcp.services.iam.authorization.AuditTrail;
 import io.floci.gcp.services.iam.authorization.AuditedMethod;
+import io.floci.gcp.services.iam.authorization.IamAuthorizationService;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -23,11 +24,14 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
@@ -37,6 +41,12 @@ import java.util.stream.Collectors;
 public class CloudLoggingService {
 
     private static final Logger LOG = Logger.getLogger(CloudLoggingService.class);
+    // The _Required sink's inclusion filter (https://docs.cloud.google.com/logging/docs/routing/overview).
+    private static final String PRIVATE_LOG_ENTRIES_LIST = "logging.privateLogEntries.list";
+    private static final Set<String> REQUIRED_LOG_IDS = Set.of("cloudaudit.googleapis.com/activity",
+            "externalaudit.googleapis.com/activity", "cloudaudit.googleapis.com/system_event",
+            "externalaudit.googleapis.com/system_event", "cloudaudit.googleapis.com/access_transparency",
+            "externalaudit.googleapis.com/access_transparency");
 
     private final StorageBackend<String, StoredLogEntry> entryStore;
     private final AtomicLong sequence = new AtomicLong(0);
@@ -47,17 +57,20 @@ public class CloudLoggingService {
     private final CloudLoggingSinkService sinkService;
     private final CloudLoggingMetricService metricService;
     private final Instance<AuditTrail> auditTrail;
+    private final Instance<IamAuthorizationService> authorization;
 
     @Inject
     public CloudLoggingService(ServiceRegistry serviceRegistry, EmulatorConfig config,
             StorageFactory storageFactory, GrpcServerManager grpcServerManager, CloudLoggingSinkService sinkService,
-            CloudLoggingMetricService metricService, Instance<AuditTrail> auditTrail) {
+            CloudLoggingMetricService metricService, Instance<AuditTrail> auditTrail,
+            Instance<IamAuthorizationService> authorization) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.sinkService = sinkService;
         this.metricService = metricService;
         this.auditTrail = auditTrail;
+        this.authorization = authorization;
         this.entryStore = storageFactory.createGlobal("cloudlogging-entries", "cloudlogging-entries.json",
                 new TypeReference<Map<String, StoredLogEntry>>() {});
     }
@@ -70,6 +83,7 @@ public class CloudLoggingService {
         this.sinkService = null;
         this.metricService = null;
         this.auditTrail = null;
+        this.authorization = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -95,6 +109,17 @@ public class CloudLoggingService {
     public void writeLogEntries(String defaultLogName, String defaultResourceType,
             Map<String, String> defaultResourceLabels, Map<String, String> defaultLabels,
             List<StoredLogEntry> entries, boolean dryRun) {
+        write(defaultLogName, defaultResourceType, defaultResourceLabels, defaultLabels, entries, dryRun, false);
+    }
+
+    /** Writes the audit recorder's own entries, the only writer of {@code cloudaudit.googleapis.com} logs. */
+    void writeAuditEntries(List<StoredLogEntry> entries) {
+        write(null, null, null, null, entries, false, true);
+    }
+
+    private void write(String defaultLogName, String defaultResourceType,
+            Map<String, String> defaultResourceLabels, Map<String, String> defaultLabels,
+            List<StoredLogEntry> entries, boolean dryRun, boolean audit) {
         if (entries.isEmpty()) {
             throw GcpException.invalidArgument("WriteLogEntries requires at least one entry");
         }
@@ -105,6 +130,9 @@ public class CloudLoggingService {
                         "Log entry is missing a log_name and no default log_name was provided");
             }
             entry.setLogName(logName);
+            if (!audit && isAuditLog(logName)) {
+                throw GcpException.invalidArgument("Log entries cannot be written to the audit log " + logName);
+            }
 
             if (entry.getResourceType() == null) {
                 entry.setResourceType(defaultResourceType != null ? defaultResourceType : "global");
@@ -163,6 +191,7 @@ public class CloudLoggingService {
         List<StoredLogEntry> matched = entryStore.scan(k -> true).stream()
                 .filter(e -> prefixes.stream().anyMatch(p -> e.getLogName().startsWith(p)))
                 .filter(filterPredicate)
+                .filter(this::readableByCaller)
                 .sorted(comparator)
                 .collect(Collectors.toList());
 
@@ -209,6 +238,31 @@ public class CloudLoggingService {
         }
     }
 
+    /**
+     * Data Access audit logs need {@code logging.privateLogEntries.list}: Logs Viewer "cannot view Data Access audit
+     * logs that are in the _Default bucket", Private Logs Viewer can (https://docs.cloud.google.com/logging/docs/audit).
+     * In enforce mode an evaluated caller without it does not see them; other callers see every entry.
+     */
+    private boolean readableByCaller(StoredLogEntry entry) {
+        if (authorization == null || !authorization.isResolvable()
+                || !"cloudaudit.googleapis.com/data_access".equals(logId(entry.getLogName()))) {
+            return true;
+        }
+        String project = entry.getLogName().substring(0, entry.getLogName().indexOf("/logs/"));
+        return !authorization.get().testPermissions(project, List.of(PRIVATE_LOG_ENTRIES_LIST)).isEmpty();
+    }
+
+    /** The audit logs Cloud Audit Logs writes, named {@code {parent}/logs/cloudaudit.googleapis.com%2F{type}}. */
+    static boolean isAuditLog(String logName) {
+        return logId(logName).startsWith("cloudaudit.googleapis.com/");
+    }
+
+    /** The decoded log ID of a log name, such as {@code cloudaudit.googleapis.com/activity}. */
+    static String logId(String logName) {
+        int marker = logName.indexOf("/logs/");
+        return marker < 0 ? "" : URLDecoder.decode(logName.substring(marker + "/logs/".length()), StandardCharsets.UTF_8);
+    }
+
     public List<String> listLogs(String parent) {
         String prefix = parent + "/logs/";
         return entryStore.scan(k -> true).stream()
@@ -220,6 +274,11 @@ public class CloudLoggingService {
     }
 
     public void deleteLog(String logName) {
+        if (logName != null && REQUIRED_LOG_IDS.contains(logId(logName))) {
+            // logs.delete "Deletes all the log entries in a log for the global _Default Log Bucket"; these logs
+            // are routed to the _Required bucket, whose entries cannot be deleted.
+            throw GcpException.invalidArgument("Log entries in the _Required bucket cannot be deleted: " + logName);
+        }
         List<StoredLogEntry> entries = entryStore.scan(k -> true).stream()
                 .filter(e -> logName.equals(e.getLogName()))
                 .collect(Collectors.toList());

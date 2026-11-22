@@ -5,13 +5,17 @@ import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.logging.v2.CreateLogMetricRequest;
 import com.google.logging.v2.CreateSinkRequest;
 import com.google.logging.v2.DeleteLogMetricRequest;
+import com.google.logging.v2.DeleteLogRequest;
 import com.google.logging.v2.DeleteSinkRequest;
 import com.google.logging.v2.GetLogMetricRequest;
 import com.google.logging.v2.GetSinkRequest;
+import com.google.logging.v2.ListLogEntriesRequest;
 import com.google.logging.v2.ListLogMetricsRequest;
+import com.google.logging.v2.ListLogsRequest;
 import com.google.logging.v2.ListSinksRequest;
 import com.google.logging.v2.UpdateLogMetricRequest;
 import com.google.logging.v2.UpdateSinkRequest;
+import com.google.logging.v2.WriteLogEntriesRequest;
 import com.google.protobuf.Message;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.IamResource;
@@ -34,11 +38,19 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     private static final String SINK = PARENT + "/sinks/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}";
     private static final String METRIC = "projects/[^/]+/metrics/[^\\s]+";
     private static final Set<String> VIEWER = Set.of("logging.sinks.get", "logging.sinks.list",
-            "logging.logMetrics.get", "logging.logMetrics.list");
-    private static final Set<String> ADMIN = Set.of("logging.sinks.create", "logging.sinks.get",
+            "logging.logMetrics.get", "logging.logMetrics.list", "logging.logEntries.list", "logging.logs.list");
+    private static final Set<String> PRIVATE_VIEWER = Set.of("logging.sinks.get", "logging.sinks.list",
+            "logging.logMetrics.get", "logging.logMetrics.list", "logging.logEntries.list", "logging.logs.list",
+            "logging.privateLogEntries.list");
+    private static final Set<String> CONFIG_WRITER = Set.of("logging.sinks.create", "logging.sinks.get",
             "logging.sinks.list", "logging.sinks.update", "logging.sinks.delete",
             "logging.logMetrics.create", "logging.logMetrics.get", "logging.logMetrics.list",
             "logging.logMetrics.update", "logging.logMetrics.delete");
+    private static final Set<String> ADMIN = Set.of("logging.sinks.create", "logging.sinks.get",
+            "logging.sinks.list", "logging.sinks.update", "logging.sinks.delete",
+            "logging.logMetrics.create", "logging.logMetrics.get", "logging.logMetrics.list",
+            "logging.logMetrics.update", "logging.logMetrics.delete", "logging.logEntries.list",
+            "logging.logEntries.create", "logging.privateLogEntries.list", "logging.logs.list", "logging.logs.delete");
 
     @Override
     public String serviceName() {
@@ -47,16 +59,39 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
 
     @Override
     public Set<Class<?>> restControllers() {
-        return Set.of(CloudLoggingConfigHttpController.class, CloudLoggingMetricsHttpController.class);
+        return Set.of(CloudLoggingConfigHttpController.class, CloudLoggingMetricsHttpController.class,
+                CloudLoggingHttpController.class);
     }
 
     @Override
     public Set<String> grpcServices() {
-        return Set.of("google.logging.v2.ConfigServiceV2", "google.logging.v2.MetricsServiceV2");
+        return Set.of("google.logging.v2.ConfigServiceV2", "google.logging.v2.MetricsServiceV2",
+                "google.logging.v2.LoggingServiceV2");
     }
 
     @Override
     public IamOperation restOperation(String method, Map<String, String> path, JsonNode body) {
+        switch (method) {
+            case "writeLogEntries" -> {
+                String logName = body.path("logName").asText("");
+                if (logName.isEmpty()) {
+                    logName = body.path("entries").path(0).path("logName").asText("");
+                }
+                return new IamOperation("WriteLogEntries", logParent(logName));
+            }
+            case "listLogEntries" -> {
+                return new IamOperation("ListLogEntries", body.path("resourceNames").path(0).asText(""));
+            }
+            case "listLogs" -> {
+                return new IamOperation("ListLogs", "projects/" + path.get("project"));
+            }
+            case "deleteLog" -> {
+                return new IamOperation("DeleteLog", "projects/" + path.get("project"));
+            }
+            default -> {
+                // Sink and metric methods below.
+            }
+        }
         if (method.endsWith("LogMetric") || method.endsWith("LogMetrics")) {
             String project = "projects/" + path.get("project");
             String metric = path.containsKey("metricId") ? project + "/metrics/" + path.get("metricId") : project;
@@ -131,6 +166,12 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     @Override
     public IamOperation grpcOperation(String method, Message request) {
         return switch (request) {
+            case WriteLogEntriesRequest value -> new IamOperation(method, logParent(value.getLogName().isEmpty()
+                    && value.getEntriesCount() > 0 ? value.getEntries(0).getLogName() : value.getLogName()));
+            case ListLogEntriesRequest value -> new IamOperation(method,
+                    value.getResourceNamesCount() > 0 ? value.getResourceNames(0) : "");
+            case ListLogsRequest value -> new IamOperation(method, value.getParent());
+            case DeleteLogRequest value -> new IamOperation(method, logParent(value.getLogName()));
             case CreateSinkRequest value -> new IamOperation(method,
                     value.getParent() + "/sinks/" + value.getSink().getName());
             case ListSinksRequest value -> new IamOperation(method, value.getParent());
@@ -149,6 +190,22 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
 
     @Override
     public List<IamPermissionCheck> checks(IamOperation operation) {
+        String entries = switch (operation.name()) {
+            // entries.write needs "logging.logEntries.create", entries.list "logging.logEntries.list" (or the
+            // private or view permissions), logs.list "logging.logs.list", logs.delete "logging.logs.delete":
+            // https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write and siblings.
+            case "WriteLogEntries" -> "logging.logEntries.create";
+            case "ListLogEntries" -> "logging.logEntries.list";
+            case "ListLogs" -> "logging.logs.list";
+            case "DeleteLog" -> "logging.logs.delete";
+            default -> null;
+        };
+        if (entries != null) {
+            if (!operation.resource().matches("projects/[^/]+")) {
+                throw unsupported("log entries outside a project: " + operation.resource());
+            }
+            return List.of(new IamPermissionCheck(entries, IamResource.project(operation.resource())));
+        }
         String permission = switch (operation.name()) {
             case "CreateSink" -> "logging.sinks.create";
             case "ListSinks" -> "logging.sinks.list";
@@ -187,8 +244,10 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
 
     @Override
     public Map<String, Set<String>> roles() {
-        return Map.of("roles/logging.admin", ADMIN, "roles/logging.configWriter", ADMIN,
-                "roles/logging.privateLogViewer", VIEWER, "roles/logging.viewer", VIEWER);
+        // https://docs.cloud.google.com/iam/docs/roles-permissions/logging
+        return Map.of("roles/logging.admin", ADMIN, "roles/logging.configWriter", CONFIG_WRITER,
+                "roles/logging.privateLogViewer", PRIVATE_VIEWER, "roles/logging.viewer", VIEWER,
+                "roles/logging.logWriter", Set.of("logging.logEntries.create"));
     }
 
     @Override
@@ -208,6 +267,12 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     @Override
     public Map<String, Set<String>> basicRoles() {
         return Map.of("roles/owner", ADMIN, "roles/editor", VIEWER, "roles/viewer", VIEWER);
+    }
+
+    /** The project of a log name such as {@code projects/p/logs/app}, or the name when it is not one. */
+    private static String logParent(String logName) {
+        int marker = logName.indexOf("/logs/");
+        return marker < 0 ? logName : logName.substring(0, marker);
     }
 
     private IamResource parentResource(String name) {

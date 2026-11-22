@@ -26,6 +26,10 @@ import io.grpc.Metadata;
 import io.grpc.stub.MetadataUtils;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -52,6 +56,11 @@ class LoggingExportIamEnforcementTest {
         }
         GoogleCredentials caller = GoogleCredentials.create(new AccessToken(token.getAccessToken(),
                 Date.from(Instant.ofEpochSecond(token.getExpireTime().getSeconds()))));
+        if (enforce) {
+            // Writing and deleting log entries need logging.logEntries.create and logging.logs.delete on the project.
+            setProjectPolicy(TestFixtures.projectId(), "{\"bindings\":[{\"role\":\"roles/logging.admin\","
+                    + "\"members\":[\"serviceAccount:" + callerEmail + "\"]}]}");
+        }
         Storage storage = TestFixtures.storageClient(caller);
         storage.create(BucketInfo.of(id));
         ConfigSettings settings = ConfigSettings.newBuilder()
@@ -89,6 +98,9 @@ class LoggingExportIamEnforcementTest {
                 logging.deleteLog(log);
             }
         } finally {
+            if (enforce) {
+                setProjectPolicy(TestFixtures.projectId(), "{}");
+            }
             channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
             objects(storage, id).forEach(blob -> storage.delete(blob.getBlobId()));
             storage.delete(id);
@@ -107,5 +119,16 @@ class LoggingExportIamEnforcementTest {
     private static void write(LoggingClient logging, String log, String text) {
         logging.writeLogEntries(WriteLogEntriesRequest.newBuilder().setLogName(log)
                 .addEntries(LogEntry.newBuilder().setTextPayload(text)).build());
+    }
+
+    private static void setProjectPolicy(String project, String policy) throws Exception {
+        try (HttpClient http = HttpClient.newHttpClient()) {
+            HttpResponse<String> response = http.send(HttpRequest.newBuilder(URI.create(TestFixtures.endpoint()
+                            + "/v1/projects/" + project + ":setIamPolicy"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("{\"policy\":" + policy + "}")).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        }
     }
 }
