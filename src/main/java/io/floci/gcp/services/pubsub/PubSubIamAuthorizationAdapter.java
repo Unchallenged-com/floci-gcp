@@ -1,6 +1,7 @@
 package io.floci.gcp.services.pubsub;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.protobuf.Message;
 import com.google.pubsub.v1.AcknowledgeRequest;
 import com.google.pubsub.v1.CreateSnapshotRequest;
@@ -29,6 +30,8 @@ import com.google.pubsub.v1.UpdateSubscriptionRequest;
 import com.google.pubsub.v1.UpdateTopicRequest;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
@@ -36,6 +39,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -218,6 +222,67 @@ public class PubSubIamAuthorizationAdapter implements IamAuthorizationAdapter {
             case "Seek" -> new IamOperation("seek", required(((SeekRequest) request).getSubscription(), "subscription"), ((SeekRequest) request).getSnapshot());
             default -> throw unsupported("gRPC operation " + method);
         };
+    }
+
+    /**
+     * Topic, subscription and snapshot changes and IAM policy changes, the Admin Activity methods of
+     * https://docs.cloud.google.com/pubsub/docs/audit-logging, on the {@code pubsub_topic}, {@code pubsub_subscription}
+     * or {@code pubsub_snapshot} resource (resource list). CreateTopic and CreateSubscription record the created
+     * Topic or Subscription as their request, as Google's impersonation example shows for CreateTopic.
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        String method = switch (operation.name()) {
+            case "createTopic" -> "google.pubsub.v1.Publisher.CreateTopic";
+            case "updateTopic" -> "google.pubsub.v1.Publisher.UpdateTopic";
+            case "deleteTopic" -> "google.pubsub.v1.Publisher.DeleteTopic";
+            case "detachSubscription" -> "google.pubsub.v1.Publisher.DetachSubscription";
+            case "createSubscription" -> "google.pubsub.v1.Subscriber.CreateSubscription";
+            case "updateSubscription" -> "google.pubsub.v1.Subscriber.UpdateSubscription";
+            case "deleteSubscription" -> "google.pubsub.v1.Subscriber.DeleteSubscription";
+            case "modifyPushConfig" -> "google.pubsub.v1.Subscriber.ModifyPushConfig";
+            case "createSnapshot" -> "google.pubsub.v1.Subscriber.CreateSnapshot";
+            case "updateSnapshot" -> "google.pubsub.v1.Subscriber.UpdateSnapshot";
+            case "deleteSnapshot" -> "google.pubsub.v1.Subscriber.DeleteSnapshot";
+            case "setTopicIamPolicy", "setSubscriptionIamPolicy", "setSnapshotIamPolicy", "SetIamPolicy" ->
+                    "google.iam.v1.IAMPolicy.SetIamPolicy";
+            default -> null;
+        };
+        String[] parts = operation.resource().split("/");
+        if (method == null || parts.length != 4 || !"projects".equals(parts[0])) {
+            return Optional.empty();
+        }
+        String type = switch (parts[2]) {
+            case "topics" -> "pubsub_topic";
+            case "subscriptions" -> "pubsub_subscription";
+            case "snapshots" -> "pubsub_snapshot";
+            default -> null;
+        };
+        if (type == null) {
+            return Optional.empty();
+        }
+        String shortName = method.substring(method.lastIndexOf('.') + 1);
+        Map<String, Object> audited;
+        if (method.endsWith("SetIamPolicy")) {
+            audited = AuditedMethod.request("google.iam.v1.SetIamPolicyRequest", null);
+            audited.put("resource", operation.resource());
+            audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+        } else if (shortName.equals("CreateTopic") || shortName.equals("CreateSubscription")) {
+            audited = AuditedMethod.request("google.pubsub.v1." + shortName.substring("Create".length()),
+                    request.body());
+            audited.put("name", operation.resource());
+        } else {
+            audited = AuditedMethod.request("google.pubsub.v1." + shortName + "Request", request.grpc() ? request.body() : null);
+            if (!request.grpc()) {
+                audited.put(parts[2].substring(0, parts[2].length() - 1), operation.resource());
+            }
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("project_id", parts[1]);
+        labels.put(parts[2].substring(0, parts[2].length() - 1) + "_id", parts[3]);
+        return Optional.of(new AuditedMethod(SERVICE, method, operation.resource(),
+                "projects/" + parts[1], type, labels, audited,
+                method.endsWith("SetIamPolicy") ? operation.resource() : null, PermissionType.ADMIN_WRITE));
     }
 
     @Override
