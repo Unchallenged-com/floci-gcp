@@ -1,12 +1,17 @@
 package io.floci.gcp.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -63,6 +68,52 @@ public class IamRoleAuthorizationAdapter implements IamAuthorizationAdapter {
             case "undelete" -> new IamOperation("UndeleteRole", requireName(name, method));
             default -> throw unsupported("REST method " + method);
         };
+    }
+
+    /**
+     * Custom-role changes, Admin Activity methods of https://docs.cloud.google.com/iam/docs/audit-logging, on an
+     * {@code iam_role} resource ({@code project_id}, {@code role_name}: resource list). A captured CreateRole entry
+     * names the role in {@code resourceName}, checks the permission on the parent and carries the request in
+     * snake_case ({@code parent}, {@code role_id}, {@code role}).
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (!Set.of("CreateRole", "UpdateRole", "DeleteRole", "UndeleteRole").contains(operation.name())) {
+            return Optional.empty();
+        }
+        boolean create = "CreateRole".equals(operation.name());
+        String parent = create ? operation.resource()
+                : operation.resource().substring(0, operation.resource().indexOf("/roles/"));
+        String roleName = create ? parent + "/roles/" + request.body().path("roleId").asText("")
+                : operation.resource();
+        Map<String, Object> audited = AuditedMethod.request("google.iam.admin.v1." + operation.name() + "Request", null);
+        if (create) {
+            audited.put("parent", parent);
+            audited.put("role_id", request.body().path("roleId").asText(""));
+        } else {
+            audited.put("name", roleName);
+        }
+        if (!request.body().path("role").isMissingNode()) {
+            audited.put("role", snakeCase(AuditedMethod.value(request.body().path("role"))));
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        if (parent.startsWith("projects/")) {
+            labels.put("project_id", parent.substring("projects/".length()));
+        }
+        labels.put("role_name", roleName);
+        return Optional.of(new AuditedMethod(SERVICE, "google.iam.admin.v1." + operation.name(), roleName, parent,
+                "iam_role", labels, audited, null, PermissionType.ADMIN_WRITE));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object snakeCase(Object value) {
+        if (!(value instanceof Map<?, ?> map)) {
+            return value;
+        }
+        Map<String, Object> converted = new LinkedHashMap<>();
+        ((Map<String, Object>) map).forEach((key, item) ->
+                converted.put(key.replaceAll("([a-z])([A-Z])", "$1_$2").toLowerCase(Locale.ROOT), item));
+        return converted;
     }
 
     @Override

@@ -62,6 +62,10 @@ public class ResourceManagerIamAuthorizationAdapter implements IamAuthorizationA
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (Set.of("CreateProject", "DeleteProject").contains(operation.name())
+                && operation.resource().matches("projects/[^/]+")) {
+            return Optional.of(projectLifecycle(operation, request));
+        }
         boolean set = "SetIamPolicy".equals(operation.name());
         if (!set && !"GetIamPolicy".equals(operation.name()) || !operation.resource().matches("projects/[^/]+")) {
             return Optional.empty();
@@ -77,6 +81,26 @@ public class ResourceManagerIamAuthorizationAdapter implements IamAuthorizationA
         return Optional.of(new AuditedMethod("cloudresourcemanager.googleapis.com", operation.name(),
                 operation.resource(), operation.resource(), "project", Map.of("project_id", project), audited,
                 set ? operation.resource() : null, set ? PermissionType.ADMIN_WRITE : PermissionType.ADMIN_READ));
+    }
+
+    /**
+     * Project creation and deletion, Admin Activity methods of https://docs.cloud.google.com/resource-manager/docs/audit-logging
+     * (queried there as {@code methodName="CreateProject"} and {@code methodName:"DeleteProject"}). A captured
+     * CreateProject entry (2024) names the project, a {@code project} resource, empty resource attributes and a
+     * {@code google.cloudresourcemanager.v1.CreateProjectRequest} holding the project.
+     */
+    private AuditedMethod projectLifecycle(IamOperation operation, AuditRequest request) {
+        String project = operation.resource().substring("projects/".length());
+        Map<String, Object> audited = AuditedMethod.request(
+                "google.cloudresourcemanager.v1." + operation.name() + "Request", null);
+        if ("CreateProject".equals(operation.name())) {
+            audited.put("project", AuditedMethod.value(request.body()));
+        } else {
+            audited.put("projectId", project);
+        }
+        return new AuditedMethod("cloudresourcemanager.googleapis.com", operation.name(), operation.resource(),
+                operation.resource(), "project", Map.of("project_id", project), audited, null,
+                PermissionType.ADMIN_WRITE, true, List.of());
     }
 
     @Override
