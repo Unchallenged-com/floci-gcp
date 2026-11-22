@@ -222,6 +222,9 @@ public class AuditLogRecorder implements AuditTrail {
         if (method.request() != null) {
             audit.setRequest(Structs.toStruct(method.request()));
         }
+        if (code == Code.OK_VALUE && method.serviceData() != null) {
+            audit.setServiceData(ProtoPayloads.toAny(method.serviceData()));
+        }
         if (code == Code.OK_VALUE && call.policyBefore() != null) {
             StoredPolicy policyAfter = policy(method.policyResource());
             if (policyAfter != null) {

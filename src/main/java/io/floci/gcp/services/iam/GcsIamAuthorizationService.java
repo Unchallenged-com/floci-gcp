@@ -268,9 +268,15 @@ public class GcsIamAuthorizationService {
         if (!isAuthenticatedCaller(authorizationHeader) || auditTrail == null || !auditTrail.isResolvable()) {
             return;
         }
+        IamResource resource = object == null || "storage.objects.list".equals(permission)
+                ? IamResource.gcsBucket(bucket) : IamResource.gcsObject(bucket, object);
+        // Captured bucket deletions (2023-03-09) check storage.buckets.getIamPolicy before storage.buckets.delete.
+        List<IamPermissionCheck> checks = "storage.buckets.delete".equals(permission)
+                ? List.of(new IamPermissionCheck("storage.buckets.getIamPolicy", resource),
+                        new IamPermissionCheck(permission, resource))
+                : List.of(new IamPermissionCheck(permission, resource));
         adapter.storageAuditedMethod(bucket, object, permission).ifPresent(method -> auditTrail.get().record(method,
-                List.of(new IamPermissionCheck(permission, object == null || "storage.objects.list".equals(permission)
-                        ? IamResource.gcsBucket(bucket) : IamResource.gcsObject(bucket, object)))));
+                checks));
     }
 
     private static boolean isAuthenticatedCaller(String authorizationHeader) {

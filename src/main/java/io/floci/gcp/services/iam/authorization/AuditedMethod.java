@@ -21,13 +21,22 @@ import java.util.Map;
  * @param bareAuthorization true when the entry's {@code authorizationInfo} carries neither a {@code permissionType}
  *        nor resource attributes, as Cloud Storage entries are captured
  * @param resourceLocations the {@code resourceLocation.currentLocations} of the entry, empty for none
+ * @param serviceData a fixed {@code serviceData} object (with its {@code @type}) the entry carries, or null
  */
 public record AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
         String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
         String policyResource, PermissionType permissionType, boolean bareAuthorization,
-        List<String> resourceLocations) {
+        List<String> resourceLocations, Map<String, Object> serviceData) {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    public AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
+            String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
+            String policyResource, PermissionType permissionType, boolean bareAuthorization,
+            List<String> resourceLocations) {
+        this(serviceName, methodName, resourceName, logParent, resourceType, resourceLabels, request, policyResource,
+                permissionType, bareAuthorization, resourceLocations, null);
+    }
 
     public AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
             String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,

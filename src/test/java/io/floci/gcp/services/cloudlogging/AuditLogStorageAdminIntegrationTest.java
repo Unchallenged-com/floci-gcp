@@ -62,12 +62,19 @@ class AuditLogStorageAdminIntegrationTest {
         assertEquals(Map.of("bucket_name", bucket, "location", "us-central1", "project_id", project),
                 createdEntry.getMap("resource.labels"));
 
+        assertEquals(List.of(
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketOwner", "member", "projectEditor:" + project),
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketOwner", "member", "projectOwner:" + project),
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketReader", "member", "projectViewer:" + project)),
+                created.getList("serviceData.policyDelta.bindingDeltas"));
+
         JsonPath policy = payload(entries.get(2));
         assertEquals("storage.buckets.setIamPolicy", policy.getString("authorizationInfo[0].permission"));
         assertEquals("type.googleapis.com/google.iam.v1.logging.AuditData", policy.getString("serviceData.'@type'"));
         // The replaced policy also drops the creator's bootstrap grant, which the delta reports as a REMOVE.
         assertTrue(policy.getList("serviceData.policyDelta.bindingDeltas").contains(
                 Map.of("action", "ADD", "role", "roles/storage.objectViewer", "member", "allUsers")));
-        assertEquals("storage.buckets.delete", payload(entries.get(3)).getString("authorizationInfo[0].permission"));
+        assertEquals(List.of("storage.buckets.getIamPolicy", "storage.buckets.delete"),
+                payload(entries.get(3)).getList("authorizationInfo.permission"));
     }
 }

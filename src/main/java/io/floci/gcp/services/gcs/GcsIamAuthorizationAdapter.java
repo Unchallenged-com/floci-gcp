@@ -128,9 +128,17 @@ public class GcsIamAuthorizationAdapter implements IamAuthorizationAdapter {
         labels.put("bucket_name", bucket);
         labels.put("location", region);
         labels.put("project_id", project);
+        // Captured buckets.create entries (2023-03-09 and 2026-01-04) record the bucket's initial legacy-role
+        // grants to the project's owners, editors and viewers, in this order.
+        Map<String, Object> serviceData = new LinkedHashMap<>();
+        serviceData.put("@type", "type.googleapis.com/google.iam.v1.logging.AuditData");
+        serviceData.put("policyDelta", Map.of("bindingDeltas", List.of(
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketOwner", "member", "projectEditor:" + project),
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketOwner", "member", "projectOwner:" + project),
+                Map.of("action", "ADD", "role", "roles/storage.legacyBucketReader", "member", "projectViewer:" + project))));
         return new AuditedMethod(STORAGE, "storage.buckets.create", "projects/_/buckets/" + bucket,
                 "projects/" + project, "gcs_bucket", labels, null, null, PermissionType.ADMIN_WRITE, true,
-                List.of(region));
+                List.of(region), serviceData);
     }
 
     /** {@code storage.buckets.list} in a project, as captured: resource {@code projects/_/buckets/*}. */
