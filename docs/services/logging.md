@@ -491,7 +491,11 @@ and counted by log-based metrics like any other entry.
 
 Each entry carries `serviceName`, `methodName`, `resourceName`, `status` (`{}` on success, the call's
 code and message otherwise), `authenticationInfo` (`principalEmail` and `principalSubject` of a
-Floci-issued service-account token; empty for anonymous and external credentials), one
+Floci-issued service-account token; empty for anonymous and external credentials; with
+`serviceAccountKeyName` when the token came from a `jwt-bearer` exchange verified by a key, and
+`serviceAccountDelegationInfo[].firstPartyPrincipal.principalEmail` for each principal that minted it
+through `generateAccessToken`, as in Google's
+[service account examples](https://docs.cloud.google.com/iam/docs/audit-logging/examples-service-accounts)), one
 `authorizationInfo` per permission the call needs (`granted` is false, and so left out of proto3 JSON,
 when IAM refused the call), `requestMetadata` (`callerIp`, `callerSuppliedUserAgent`,
 `requestAttributes.time`), and the RPC `request` with its `@type`. SetIamPolicy entries add

@@ -35,6 +35,11 @@ public class IamPrincipalResolver {
         this(tokenService, null, null);
     }
 
+    /** The Floci-issued token behind a bearer credential, with its audit origin; empty for any other credential. */
+    public Optional<StoredCredentialToken> credential(String authorization) {
+        return bearerToken(authorization).flatMap(tokenService::lookupBearerToken);
+    }
+
     public Resolution resolve(String authorization) {
         if (authorization == null || authorization.isBlank()) {
             return Resolution.anonymous();

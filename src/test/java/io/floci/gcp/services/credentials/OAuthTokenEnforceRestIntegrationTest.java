@@ -137,7 +137,7 @@ class OAuthTokenEnforceRestIntegrationTest {
                 assertTrue(released.await(10, TimeUnit.SECONDS), "the exchange was never released");
             }
             return invocation.callRealMethod();
-        }).when(tokens).mintImpersonatedToken(eq(email), any(), any());
+        }).when(tokens).mintImpersonatedToken(eq(email), any(), any(), any(), any());
 
         CompletableFuture<Response> exchanged = CompletableFuture.supplyAsync(() -> exchange("/token", assertion));
         assertTrue(paused.await(10, TimeUnit.SECONDS), "the exchange never reached the token store");
@@ -163,7 +163,7 @@ class OAuthTokenEnforceRestIntegrationTest {
                 assertTrue(released.await(10, TimeUnit.SECONDS), "the exchange was never released");
             }
             return invocation.callRealMethod();
-        }).when(tokens).mintImpersonatedToken(eq(email), any(), any());
+        }).when(tokens).mintImpersonatedToken(eq(email), any(), any(), any(), any());
 
         CompletableFuture<Response> exchanged = CompletableFuture.supplyAsync(() -> exchange("/token", assertion));
         assertTrue(paused.await(10, TimeUnit.SECONDS), "the exchange never reached the token store");

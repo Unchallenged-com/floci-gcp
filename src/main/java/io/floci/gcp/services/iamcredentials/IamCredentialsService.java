@@ -22,6 +22,7 @@ import jakarta.inject.Inject;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -86,6 +87,16 @@ public class IamCredentialsService {
     }
 
     public GeneratedAccessToken generateAccessToken(String serviceAccount, List<?> scopes, Object lifetime) {
+        return generateAccessToken(serviceAccount, scopes, lifetime, null);
+    }
+
+    /**
+     * Mints a token for {@code serviceAccount}; a caller authenticated with a Floci token is recorded as the
+     * token's delegator, after its own delegators, so audit entries made with it name who impersonated the
+     * account ({@code serviceAccountDelegationInfo}).
+     */
+    public GeneratedAccessToken generateAccessToken(String serviceAccount, List<?> scopes, Object lifetime,
+            String callerAuthorization) {
         if (serviceAccount == null || serviceAccount.isBlank()) {
             throw GcpException.invalidArgument("service account is required");
         }
@@ -96,8 +107,22 @@ public class IamCredentialsService {
         String principal = iamService != null && serviceAccount.chars().allMatch(Character::isDigit)
                 ? iamService.getServiceAccount("-", serviceAccount).getEmail() : serviceAccount;
         StoredCredentialToken token = tokenService.mintImpersonatedToken(principal, expireTime,
-                () -> requireEnabledTarget(serviceAccount));
+                () -> requireEnabledTarget(serviceAccount), null, delegates(callerAuthorization));
         return new GeneratedAccessToken(token.getTokenValue(), expireTime);
+    }
+
+    private List<String> delegates(String authorization) {
+        if (authorization == null || !authorization.regionMatches(true, 0, "Bearer ", 0, 7)) {
+            return List.of();
+        }
+        return tokenService.lookupBearerToken(authorization.substring(7).trim())
+                .filter(caller -> caller.getTokenKind() == StoredCredentialToken.TokenKind.IMPERSONATED)
+                .map(caller -> {
+                    List<String> chain = new ArrayList<>(caller.getDelegates());
+                    chain.add(caller.getPrincipal());
+                    return List.copyOf(chain);
+                })
+                .orElse(List.of());
     }
 
     /** Signs the base64 {@code payload} with the service account's Google-managed key. */

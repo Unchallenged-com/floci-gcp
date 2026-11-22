@@ -21,6 +21,10 @@ public class StoredCredentialToken {
 	private String principal;
 	private List<CredentialAccessBoundaryRule> gcsRules = new ArrayList<>();
 	private boolean revoked;
+	// Audit identity: the key a jwt-bearer exchange verified, and the principals that minted the token through
+	// generateAccessToken, first delegator first.
+	private String serviceAccountKeyName;
+	private List<String> delegates = new ArrayList<>();
 
 	public StoredCredentialToken() {
 	}
@@ -89,5 +93,21 @@ public class StoredCredentialToken {
 
 	public void setRevoked(boolean revoked) {
 		this.revoked = revoked;
+	}
+
+	public String getServiceAccountKeyName() {
+		return serviceAccountKeyName;
+	}
+
+	public void setServiceAccountKeyName(String serviceAccountKeyName) {
+		this.serviceAccountKeyName = serviceAccountKeyName;
+	}
+
+	public List<String> getDelegates() {
+		return delegates;
+	}
+
+	public void setDelegates(List<String> delegates) {
+		this.delegates = delegates == null ? new ArrayList<>() : new ArrayList<>(delegates);
 	}
 }

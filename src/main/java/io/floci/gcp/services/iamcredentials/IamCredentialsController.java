@@ -4,10 +4,12 @@ import io.floci.gcp.services.iam.IamService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
@@ -33,12 +35,13 @@ public class IamCredentialsController {
     @POST
     @Path("/-/serviceAccounts/{serviceAccount}:generateAccessToken")
     public Response generateAccessToken(@PathParam("serviceAccount") String serviceAccount,
-            Map<String, Object> body) {
+            @HeaderParam(HttpHeaders.AUTHORIZATION) String authorization, Map<String, Object> body) {
         List<?> scopes = body != null && body.get("scope") instanceof List<?> scopeList
                 ? scopeList
                 : null;
         IamCredentialsService.GeneratedAccessToken token =
-                service.generateAccessToken(serviceAccount, scopes, body != null ? body.get("lifetime") : null);
+                service.generateAccessToken(serviceAccount, scopes, body != null ? body.get("lifetime") : null,
+                        authorization);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("accessToken", token.accessToken());

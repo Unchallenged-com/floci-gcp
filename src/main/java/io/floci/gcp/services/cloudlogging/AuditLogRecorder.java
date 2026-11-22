@@ -7,6 +7,7 @@ import com.google.cloud.audit.AuthenticationInfo;
 import com.google.cloud.audit.AuthorizationInfo;
 import com.google.cloud.audit.RequestMetadata;
 import com.google.cloud.audit.ResourceLocation;
+import com.google.cloud.audit.ServiceAccountDelegationInfo;
 import com.google.iam.v1.BindingDelta;
 import com.google.iam.v1.PolicyDelta;
 import com.google.iam.v1.logging.AuditData;
@@ -18,6 +19,7 @@ import com.google.rpc.Status;
 import com.google.rpc.context.AttributeContext;
 import com.google.type.Expr;
 import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
+import io.floci.gcp.services.credentials.StoredCredentialToken;
 import io.floci.gcp.services.iam.IamPrincipal;
 import io.floci.gcp.services.iam.IamPrincipalResolver;
 import io.floci.gcp.services.iam.IamResource;
@@ -113,7 +115,7 @@ public class AuditLogRecorder implements AuditTrail {
     /** What is known of an audited call before it runs. */
     public record Call(IamAuthorizationAdapter adapter, IamOperation operation, AuditRequest request,
             AuditedMethod method, List<IamPermissionCheck> checks, IamPrincipal principal, String callerIp,
-            String userAgent, Instant time, StoredPolicy policyBefore) {
+            String userAgent, Instant time, StoredPolicy policyBefore, StoredCredentialToken credential) {
     }
 
     /** Records the call an adapter describes, if it does, in the transport's scope. Never fails the call. */
@@ -126,7 +128,7 @@ public class AuditLogRecorder implements AuditTrail {
             }
             scope.add(new Call(adapter, operation, request, method.get(), checks(adapter, operation),
                     principal(scope.authorization), scope.callerIp, scope.userAgent, time,
-                    policy(method.get().policyResource())));
+                    policy(method.get().policyResource()), credential(scope.authorization)));
         } catch (RuntimeException e) {
             LOG.debugf(e, "No audit entry for %s on %s", operation.name(), operation.resource());
         }
@@ -141,7 +143,7 @@ public class AuditLogRecorder implements AuditTrail {
             return;
         }
         scope.add(new Call(null, null, null, method, checks, principal(scope.authorization), scope.callerIp,
-                scope.userAgent, Instant.now(), policy(method.policyResource())));
+                scope.userAgent, Instant.now(), policy(method.policyResource()), credential(scope.authorization)));
     }
 
     /** Writes every entry recorded in the scope; {@code code} is the call's {@code google.rpc.Code}. */
@@ -191,7 +193,7 @@ public class AuditLogRecorder implements AuditTrail {
                 .setResourceName(method.resourceName())
                 .setStatus(code == Code.OK_VALUE ? Status.getDefaultInstance()
                         : Status.newBuilder().setCode(code).setMessage(message == null ? "" : message).build())
-                .setAuthenticationInfo(authentication(call.principal()))
+                .setAuthenticationInfo(authentication(call.principal(), call.credential()))
                 .setRequestMetadata(RequestMetadata.newBuilder()
                         .setCallerIp(call.callerIp() == null ? "" : call.callerIp())
                         .setCallerSuppliedUserAgent(call.userAgent() == null ? "" : call.userAgent())
@@ -327,7 +329,20 @@ public class AuditLogRecorder implements AuditTrail {
         }
     }
 
-    private static AuthenticationInfo authentication(IamPrincipal principal) {
+    private StoredCredentialToken credential(String authorization) {
+        try {
+            return principals.credential(authorization).orElse(null);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The caller, the service account key its token was exchanged for ({@code serviceAccountKeyName}), and the
+     * principals that impersonated it, as {@code serviceAccountDelegationInfo[].firstPartyPrincipal.principalEmail}
+     * (https://docs.cloud.google.com/iam/docs/audit-logging/examples-service-accounts).
+     */
+    private static AuthenticationInfo authentication(IamPrincipal principal, StoredCredentialToken credential) {
         AuthenticationInfo.Builder builder = AuthenticationInfo.newBuilder();
         if (principal.isAuthenticated()) {
             String member = principal.member();
@@ -335,6 +350,16 @@ public class AuditLogRecorder implements AuditTrail {
                 builder.setPrincipalEmail(member.substring(SERVICE_ACCOUNT_MEMBER.length()));
             }
             builder.setPrincipalSubject(member);
+            if (credential != null) {
+                if (credential.getServiceAccountKeyName() != null) {
+                    builder.setServiceAccountKeyName(credential.getServiceAccountKeyName());
+                }
+                for (String delegate : credential.getDelegates()) {
+                    builder.addServiceAccountDelegationInfo(ServiceAccountDelegationInfo.newBuilder()
+                            .setFirstPartyPrincipal(ServiceAccountDelegationInfo.FirstPartyPrincipal.newBuilder()
+                                    .setPrincipalEmail(delegate)));
+                }
+            }
         }
         return builder.build();
     }

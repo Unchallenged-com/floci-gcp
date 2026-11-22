@@ -55,6 +55,15 @@ public class CredentialTokenService {
      */
     public StoredCredentialToken mintImpersonatedToken(String principal, Instant expireTime,
             Runnable requireAccount) {
+        return mintImpersonatedToken(principal, expireTime, requireAccount, null, List.of());
+    }
+
+    /**
+     * Like {@link #mintImpersonatedToken(String, Instant, Runnable)}, recording where the token comes from for audit
+     * entries: the service account key a jwt-bearer exchange verified, or the principals that impersonated the account.
+     */
+    public StoredCredentialToken mintImpersonatedToken(String principal, Instant expireTime,
+            Runnable requireAccount, String serviceAccountKeyName, List<String> delegates) {
         if (principal == null || principal.isBlank()) {
             throw GcpException.invalidArgument("service account is required");
         }
@@ -70,6 +79,8 @@ public class CredentialTokenService {
                 null,
                 principal,
                 List.of());
+        token.setServiceAccountKeyName(serviceAccountKeyName);
+        token.setDelegates(delegates);
         synchronized (issuanceLock) {
             requireAccount.run();
             tokenStore.put(tokenValue, token);

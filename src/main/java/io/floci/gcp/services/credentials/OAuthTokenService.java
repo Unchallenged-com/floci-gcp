@@ -172,11 +172,25 @@ public class OAuthTokenService {
         StoredCredentialToken token;
         try {
             token = tokens.mintImpersonatedToken(email, clock.instant().plusSeconds(TOKEN_LIFETIME_SECONDS),
-                    () -> requireEnabledAccount(email, uniqueId));
+                    () -> requireEnabledAccount(email, uniqueId), keyName(email, header.path("kid").asText("")),
+                    List.of());
         } catch (RefusedAssertion refused) {
             return refused.response;
         }
         return tokenResponse(token.getTokenValue(), TOKEN_LIFETIME_SECONDS);
+    }
+
+    /**
+     * The key's full resource name as audit entries show it: "//iam.googleapis.com/projects/project-id/
+     * serviceAccounts/service-account-email/keys/key-id"
+     * (https://docs.cloud.google.com/iam/docs/audit-logging/examples-service-accounts).
+     */
+    private static String keyName(String email, String keyId) {
+        int at = email.indexOf('@');
+        String domain = at < 0 ? "" : email.substring(at + 1);
+        String project = domain.endsWith(".iam.gserviceaccount.com")
+                ? domain.substring(0, domain.length() - ".iam.gserviceaccount.com".length()) : "-";
+        return "//iam.googleapis.com/projects/" + project + "/serviceAccounts/" + email + "/keys/" + keyId;
     }
 
     /**
