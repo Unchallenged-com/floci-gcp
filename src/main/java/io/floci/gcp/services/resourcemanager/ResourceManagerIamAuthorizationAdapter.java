@@ -1,6 +1,7 @@
 package io.floci.gcp.services.resourcemanager;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.IamBinding;
 import io.floci.gcp.services.iam.IamPolicy;
@@ -56,21 +57,26 @@ public class ResourceManagerIamAuthorizationAdapter implements IamAuthorizationA
     }
 
     /**
-     * SetIamPolicy on a project, over REST and the shared IAM policy gRPC mixin, as real entries record it:
+     * SetIamPolicy and GetIamPolicy on a project, over REST and the shared IAM policy gRPC mixin, as real entries record SetIamPolicy:
      * method {@code SetIamPolicy}, a {@code project} resource, and the request's bare project ID.
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
-        if (!"SetIamPolicy".equals(operation.name()) || !operation.resource().matches("projects/[^/]+")) {
+        boolean set = "SetIamPolicy".equals(operation.name());
+        if (!set && !"GetIamPolicy".equals(operation.name()) || !operation.resource().matches("projects/[^/]+")) {
             return Optional.empty();
         }
         String project = operation.resource().substring("projects/".length());
-        Map<String, Object> audited = AuditedMethod.request("google.iam.v1.SetIamPolicyRequest", null);
+        Map<String, Object> audited = AuditedMethod.request(
+                "google.iam.v1." + operation.name() + "Request", null);
         audited.put("resource", project);
-        audited.put("policy", AuditedMethod.value(request.body().path("policy")));
-        return Optional.of(new AuditedMethod("cloudresourcemanager.googleapis.com", "SetIamPolicy",
+        if (set) {
+            audited.put("policy", AuditedMethod.value(request.body().path("policy")));
+        }
+        // getIamPolicy is a Data Access (ADMIN_READ) method in https://docs.cloud.google.com/resource-manager/docs/audit-logging.
+        return Optional.of(new AuditedMethod("cloudresourcemanager.googleapis.com", operation.name(),
                 operation.resource(), operation.resource(), "project", Map.of("project_id", project), audited,
-                operation.resource()));
+                set ? operation.resource() : null, set ? PermissionType.ADMIN_WRITE : PermissionType.ADMIN_READ));
     }
 
     @Override

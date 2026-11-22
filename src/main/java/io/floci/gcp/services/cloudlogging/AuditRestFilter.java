@@ -29,7 +29,7 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Records the REST calls that write Admin Activity audit entries. It runs before IAM authorization, so
+ * Records the REST calls that write audit entries. It runs before IAM authorization, so
  * a call that authorization refuses is recorded with its PERMISSION_DENIED status.
  */
 @Provider

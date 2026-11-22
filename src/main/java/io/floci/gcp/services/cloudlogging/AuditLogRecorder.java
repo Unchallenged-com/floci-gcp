@@ -19,6 +19,8 @@ import com.google.type.Expr;
 import io.floci.gcp.services.cloudlogging.model.StoredLogEntry;
 import io.floci.gcp.services.iam.IamPrincipal;
 import io.floci.gcp.services.iam.IamPrincipalResolver;
+import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.IamResourceHierarchy;
 import io.floci.gcp.services.iam.IamService;
 import io.floci.gcp.services.iam.authorization.AuditRequest;
 import io.floci.gcp.services.iam.authorization.AuditedMethod;
@@ -40,10 +42,12 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Writes Cloud Audit Logs Admin Activity entries for the calls the IAM authorization adapters
- * describe with {@link IamAuthorizationAdapter#auditedMethod}. Transports call {@link #begin} before
- * the call runs and {@link #complete} with its outcome; both IAM authorization modes are audited, as
- * Admin Activity logs are "always written".
+ * Writes Cloud Audit Logs entries for the calls the IAM authorization adapters describe with
+ * {@link IamAuthorizationAdapter#auditedMethod}. Transports call {@link #begin} before the call runs and
+ * {@link #complete} with its outcome; both IAM authorization modes are audited. ADMIN_WRITE methods write
+ * Admin Activity entries, which are "always written"; the other permission types write Data Access entries
+ * only when the auditConfigs of the project's IAM policy, or of its organization's, enable that type for the
+ * service or for {@code allServices} and do not exempt the caller.
  *
  * <p>Sources: https://docs.cloud.google.com/logging/docs/audit (log names, caller identity and IP),
  * {@code google/cloud/audit/audit_log.proto}, and each service's audit logging page for its methods.
@@ -52,6 +56,8 @@ import java.util.Set;
 public class AuditLogRecorder {
 
     static final String ACTIVITY_LOG_ID = "cloudaudit.googleapis.com%2Factivity";
+    static final String DATA_ACCESS_LOG_ID = "cloudaudit.googleapis.com%2Fdata_access";
+    private static final String ALL_SERVICES = "allServices";
 
     private static final Logger LOG = Logger.getLogger(AuditLogRecorder.class);
     private static final String SERVICE_ACCOUNT_MEMBER = "serviceAccount:";
@@ -60,14 +66,16 @@ public class AuditLogRecorder {
     private final Instance<IamService> iam;
     private final IamPrincipalResolver principals;
     private final ObjectMapper json;
+    private final Instance<IamResourceHierarchy> hierarchy;
 
     @Inject
     public AuditLogRecorder(Instance<CloudLoggingService> logging, Instance<IamService> iam,
-            IamPrincipalResolver principals, ObjectMapper json) {
+            IamPrincipalResolver principals, ObjectMapper json, Instance<IamResourceHierarchy> hierarchy) {
         this.logging = logging;
         this.iam = iam;
         this.principals = principals;
         this.json = json;
+        this.hierarchy = hierarchy;
     }
 
     /** What is known of an audited call before it runs. */
@@ -96,6 +104,9 @@ public class AuditLogRecorder {
     /** Writes the call's entry; {@code code} is the call's {@code google.rpc.Code}. Never fails the call. */
     public void complete(Call call, int code, String message) {
         try {
+            if (!isAdminActivity(call.method()) && !dataAccessEnabled(call.method(), call.principal())) {
+                return;
+            }
             logging.get().writeLogEntries(null, null, null, null, List.of(entry(call, code, message)), false);
         } catch (RuntimeException e) {
             LOG.warnf(e, "Failed to write the audit entry for %s on %s",
@@ -136,7 +147,7 @@ public class AuditLogRecorder {
                             .setService(check.resource().service())
                             .setName(method.resourceName())
                             .setType(check.resource().type()))
-                    .setPermissionType(AuthorizationInfo.PermissionType.ADMIN_WRITE));
+                    .setPermissionType(method.permissionType()));
         }
         if (method.request() != null) {
             audit.setRequest(Structs.toStruct(method.request()));
@@ -151,13 +162,57 @@ public class AuditLogRecorder {
         }
 
         StoredLogEntry entry = new StoredLogEntry();
-        entry.setLogName(method.logParent() + "/logs/" + ACTIVITY_LOG_ID);
+        entry.setLogName(method.logParent() + "/logs/" + (isAdminActivity(method) ? ACTIVITY_LOG_ID : DATA_ACCESS_LOG_ID));
         entry.setResourceType(method.resourceType());
         entry.setResourceLabels(labels);
-        entry.setSeverity(code == Code.OK_VALUE ? "NOTICE" : "ERROR");
+        entry.setSeverity(code != Code.OK_VALUE ? "ERROR" : isAdminActivity(method) ? "NOTICE" : "INFO");
         entry.setTimestamp(call.time().toString());
         entry.setProtoPayload(ProtoPayloads.fromAny(Any.pack(audit.build())));
         return entry;
+    }
+
+    private static boolean isAdminActivity(AuditedMethod method) {
+        return method.permissionType() == AuthorizationInfo.PermissionType.ADMIN_WRITE;
+    }
+
+    /**
+     * Whether the auditConfigs of the log's resource and its ancestors enable this Data Access log type for the
+     * service, and do not exempt the caller. "the resulting configuration for the service is the union of the
+     * two configurations" (allServices and the service), and "If there is a configuration for a Google Cloud
+     * service across the hierarchy, then the resulting configuration is the union of the configurations."
+     * https://docs.cloud.google.com/logging/docs/audit/configure-data-access
+     */
+    private boolean dataAccessEnabled(AuditedMethod method, IamPrincipal principal) {
+        String logType = method.permissionType().name();
+        boolean enabled = false;
+        Set<String> exempted = new LinkedHashSet<>();
+        List<String> resources = method.logParent().startsWith("projects/")
+                ? hierarchy.get().policyResourcesFor(new IamResource("cloudresourcemanager.googleapis.com",
+                        "cloudresourcemanager.googleapis.com/Project", method.logParent(), method.logParent(),
+                        method.logParent(), true))
+                : List.of(method.logParent());
+        for (String resource : resources) {
+            StoredPolicy policy = policy(resource);
+            if (policy == null || policy.getAuditConfigs() == null) {
+                continue;
+            }
+            for (Map<String, Object> config : policy.getAuditConfigs()) {
+                Object service = config.get("service");
+                if (!ALL_SERVICES.equals(service) && !method.serviceName().equals(service)
+                        || !(config.get("auditLogConfigs") instanceof List<?> logConfigs)) {
+                    continue;
+                }
+                for (Object item : logConfigs) {
+                    if (item instanceof Map<?, ?> logConfig && logType.equals(logConfig.get("logType"))) {
+                        enabled = true;
+                        if (logConfig.get("exemptedMembers") instanceof List<?> members) {
+                            members.forEach(member -> exempted.add(String.valueOf(member)));
+                        }
+                    }
+                }
+            }
+        }
+        return enabled && !(principal.isAuthenticated() && exempted.contains(principal.member()));
     }
 
     private static Optional<AuditedMethod> after(Call call) {

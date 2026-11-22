@@ -1,6 +1,7 @@
 package io.floci.gcp.services.secretmanager;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.cloud.secretmanager.v1.AccessSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.AddSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.CreateSecretRequest;
@@ -18,11 +19,14 @@ import com.google.iam.v1.SetIamPolicyRequest;
 import com.google.iam.v1.TestIamPermissionsRequest;
 import com.google.protobuf.Message;
 import io.floci.gcp.services.iam.IamResource;
+import io.floci.gcp.services.iam.authorization.AuditRequest;
+import io.floci.gcp.services.iam.authorization.AuditedMethod;
 import io.floci.gcp.services.iam.authorization.IamAuthorizationAdapter;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -111,6 +115,40 @@ public class SecretManagerIamAuthorizationAdapter implements IamAuthorizationAda
             };
         };
         return new IamOperation(method, target);
+    }
+
+    /**
+     * The Data Access methods of https://docs.cloud.google.com/secret-manager/docs/audit-logging, with their
+     * permission types: AccessSecretVersion is DATA_READ, the metadata reads ADMIN_READ. Entries name an
+     * {@code audited_resource} with {@code method}, {@code project_id} and {@code service}, as captured
+     * AccessSecretVersion entries do; the secret payload is never recorded.
+     */
+    @Override
+    public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        PermissionType permissionType = switch (operation.name()) {
+            case "AccessSecretVersion" -> PermissionType.DATA_READ;
+            case "GetSecret", "GetSecretVersion", "ListSecrets", "ListSecretVersions", "GetIamPolicy" ->
+                    PermissionType.ADMIN_READ;
+            default -> null;
+        };
+        if (permissionType == null || !operation.resource().startsWith("projects/")) {
+            return Optional.empty();
+        }
+        String project = operation.resource().split("/")[1];
+        String methodName = "google.cloud.secretmanager.v1.SecretManagerService." + operation.name();
+        Map<String, Object> audited = AuditedMethod.request(
+                "google.cloud.secretmanager.v1." + operation.name() + "Request", null);
+        audited.put(switch (operation.name()) {
+            case "ListSecrets", "ListSecretVersions" -> "parent";
+            case "GetIamPolicy" -> "resource";
+            default -> "name";
+        }, operation.resource());
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("method", methodName);
+        labels.put("project_id", project);
+        labels.put("service", SERVICE);
+        return Optional.of(new AuditedMethod(SERVICE, methodName, operation.resource(), "projects/" + project,
+                "audited_resource", labels, audited, null, permissionType));
     }
 
     @Override

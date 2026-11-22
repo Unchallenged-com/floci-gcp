@@ -504,10 +504,34 @@ Method names and their log type follow the [IAM](https://docs.cloud.google.com/i
 [Cloud Logging](https://docs.cloud.google.com/logging/docs/audit-logging) audit logging pages; field
 shapes follow `google/cloud/audit/audit_log.proto` and entries captured from Google Cloud.
 
+### Data Access
+
+Data Access entries go to `{parent}/logs/cloudaudit.googleapis.com%2Fdata_access`, only when the
+`auditConfigs` of the project's IAM policy, or of its organization's, enable the method's permission type
+(`ADMIN_READ`, `DATA_READ` or `DATA_WRITE`) for its service or for `allServices`, and do not list the
+caller in that log type's `exemptedMembers` (the union of all matching configurations, as
+[Enable Data Access audit logs](https://docs.cloud.google.com/logging/docs/audit/configure-data-access)
+describes). They are off by default. Severity is `INFO` on success and `ERROR` on failure; a denied read is
+recorded when its type is enabled.
+
+| Service | Methods | Permission type | `resource.type` |
+|---|---|---|---|
+| IAM Credentials (`iamcredentials.googleapis.com`) | `GenerateAccessToken`, `SignJwt` | `DATA_READ` | `service_account` |
+| IAM | `google.iam.admin.v1.` `GetServiceAccount`, `GetServiceAccountKey`, `ListServiceAccountKeys`, `GetIAMPolicy` | `ADMIN_READ` | `service_account` |
+| Resource Manager | `GetIamPolicy` on a project | `ADMIN_READ` | `project` |
+| Cloud Logging | `google.logging.v2.ConfigServiceV2.GetSink` | `ADMIN_READ` | `logging_sink` |
+| Secret Manager (`secretmanager.googleapis.com`) | `google.cloud.secretmanager.v1.SecretManagerService.` `AccessSecretVersion` (`DATA_READ`); `GetSecret`, `GetSecretVersion`, `ListSecrets`, `ListSecretVersions`, `GetIamPolicy` (`ADMIN_READ`) | see method | `audited_resource` (`method`, `project_id`, `service`) |
+
+Permission types follow each service's audit logging page; Google documents none for IAM Credentials, and
+the emulator uses `DATA_READ`, as a captured GenerateAccessToken entry does. GenerateAccessToken requests
+carry `scope` and `lifetime`, SignJwt requests only `name`, and no secret payload or signed claims are ever
+recorded. Folder policies and BigQuery's always-on Data Access logs are not modeled.
+
 Deviations: `insertId` is a UUID; `response` is only written for SetIamPolicy; IAM requests carry the
 request's name and, for CreateServiceAccount, its account fields, not every field; `requestAttributes`
-always has `time`; entries are written synchronously; `principalEmail` is never redacted. Data Access,
-System Event and Policy Denied logs, and Admin Activity entries of other services, are not written.
+always has `time`; IAM Credentials entries have no `operation`; entries are written synchronously;
+`principalEmail` is never redacted. System Event and Policy Denied logs, Data Access entries of Cloud
+Storage and `ListLogEntries`, and audit entries of other services, are not written.
 
 ## Not Yet Supported
 

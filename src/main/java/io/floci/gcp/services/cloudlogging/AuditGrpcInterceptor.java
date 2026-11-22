@@ -2,6 +2,7 @@ package io.floci.gcp.services.cloudlogging;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.iam.v1.GetIamPolicyRequest;
 import com.google.iam.v1.SetIamPolicyRequest;
 import com.google.protobuf.Message;
 import io.floci.gcp.core.common.ProtoJson;
@@ -29,7 +30,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Records the unary gRPC calls that write Admin Activity audit entries. It wraps IAM authorization, so a
+ * Records the unary gRPC calls that write audit entries. It wraps IAM authorization, so a
  * call that authorization refuses is recorded with its PERMISSION_DENIED status.
  */
 @ApplicationScoped
@@ -87,15 +88,19 @@ public class AuditGrpcInterceptor implements ServerInterceptor {
     private Optional<AuditLogRecorder.Call> begin(String service, String method, Message request, Metadata headers,
             ServerCall<?, ?> call) {
         try {
+            String policyResource = !IAM_POLICY_SERVICE.equals(service) ? null : switch (request) {
+                case SetIamPolicyRequest policy -> policy.getResource();
+                case GetIamPolicyRequest policy -> policy.getResource();
+                default -> null;
+            };
             Optional<IamAuthorizationAdapter> adapter = IAM_POLICY_SERVICE.equals(service)
-                    ? (request instanceof SetIamPolicyRequest policy ? registry.resource(policy.getResource())
-                            : Optional.empty())
+                    ? (policyResource == null ? Optional.empty() : registry.resource(policyResource))
                     : registry.grpc(service);
             if (adapter.isEmpty()) {
                 return Optional.empty();
             }
-            IamOperation operation = request instanceof SetIamPolicyRequest policy
-                    ? new IamOperation(method, policy.getResource())
+            IamOperation operation = policyResource != null
+                    ? new IamOperation(method, policyResource)
                     : adapter.get().grpcOperation(method, request);
             JsonNode body = mapper.readTree(ProtoJson.print(request));
             return recorder.begin(adapter.get(), operation, new AuditRequest(method, body, Map.of(), true),

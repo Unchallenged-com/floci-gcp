@@ -1,6 +1,7 @@
 package io.floci.gcp.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.iam.authorization.AuditRequest;
 import io.floci.gcp.services.iam.authorization.AuditedMethod;
@@ -26,6 +27,7 @@ import java.util.stream.Stream;
 public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAdapter {
 
     private static final String SERVICE = "iam.googleapis.com";
+    private static final String CREDENTIALS_SERVICE = "iamcredentials.googleapis.com";
     private static final Set<String> SERVICE_ACCOUNT_ADMIN = Set.of(
             "iam.serviceAccounts.create", "iam.serviceAccounts.delete", "iam.serviceAccounts.disable",
             "iam.serviceAccounts.enable", "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy",
@@ -199,8 +201,10 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
     }
 
     /**
-     * The Admin Activity methods of https://docs.cloud.google.com/iam/docs/audit-logging for the
-     * operations this adapter maps. {@code resource} is a {@code service_account} with the account's
+     * The audited methods of https://docs.cloud.google.com/iam/docs/audit-logging for the operations this
+     * adapter maps, with their permission types (ADMIN_WRITE: Admin Activity; ADMIN_READ: Data Access), and the
+     * IAM Credentials GenerateAccessToken and SignJwt calls, Data Access entries of
+     * {@code iamcredentials.googleapis.com} as captured from Google Cloud. {@code resource} is a {@code service_account} with the account's
      * {@code email_id}, {@code project_id} and {@code unique_id}, and CreateServiceAccount names its
      * project, as real entries do.
      */
@@ -212,12 +216,22 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
             case "UpdateServiceAccount" -> "PATCH".equalsIgnoreCase(request.transportMethod())
                     ? "PatchServiceAccount" : "UpdateServiceAccount";
             case "SetIamPolicy" -> "SetIAMPolicy";
+            case "GetServiceAccount", "GetServiceAccountKey", "ListServiceAccountKeys", "GenerateAccessToken",
+                    "SignJwt" -> operation.name();
+            case "GetIamPolicy" -> "GetIAMPolicy";
             default -> null;
         };
         if (method == null) {
             return Optional.empty();
         }
-        String methodName = "google.iam.admin.v1." + method;
+        boolean credentials = Set.of("GenerateAccessToken", "SignJwt").contains(method);
+        String methodName = credentials ? method : "google.iam.admin.v1." + method;
+        PermissionType permissionType = switch (method) {
+            case "GetServiceAccount", "GetServiceAccountKey", "ListServiceAccountKeys", "GetIAMPolicy" ->
+                    PermissionType.ADMIN_READ;
+            case "GenerateAccessToken", "SignJwt" -> PermissionType.DATA_READ;
+            default -> PermissionType.ADMIN_WRITE;
+        };
         if ("CreateServiceAccount".equals(method)) {
             String project = operation.resource().substring("projects/".length());
             String email = request.body().path("accountId").asText("") + "@" + project + ".iam.gserviceaccount.com";
@@ -241,7 +255,16 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
         String accountId = labels.getOrDefault("unique_id", "").isEmpty() ? email : labels.get("unique_id");
         String resourceName = "projects/-/serviceAccounts/" + accountId + (keyMarker >= 0 ? name.substring(keyMarker) : "");
         Map<String, Object> audited;
-        if ("SetIAMPolicy".equals(method)) {
+        if (credentials) {
+            // Captured GenerateAccessToken entries carry the request's scope and lifetime; SignJwt ones only its
+            // name, never the claims to sign.
+            audited = AuditedMethod.request("google.iam.credentials.v1." + method + "Request", null);
+            audited.put("name", "projects/-/serviceAccounts/" + email);
+            if ("GenerateAccessToken".equals(method)) {
+                putIfPresent(audited, "scope", request.body().path("scope"));
+                putIfPresent(audited, "lifetime", request.body().path("lifetime"));
+            }
+        } else if ("SetIAMPolicy".equals(method)) {
             audited = AuditedMethod.request("google.iam.v1.SetIamPolicyRequest", null);
             audited.put("resource", accountName);
             audited.put("policy", AuditedMethod.value(request.body().path("policy")));
@@ -249,8 +272,9 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
             audited = AuditedMethod.request("google.iam.admin.v1." + method + "Request", null);
             audited.put("name", name);
         }
-        return Optional.of(new AuditedMethod(SERVICE, methodName, resourceName, "projects/" + project,
-                "service_account", labels, audited, "SetIAMPolicy".equals(method) ? accountName : null));
+        return Optional.of(new AuditedMethod(credentials ? CREDENTIALS_SERVICE : SERVICE, methodName, resourceName,
+                "projects/" + project, "service_account", labels, audited,
+                "SetIAMPolicy".equals(method) ? accountName : null, permissionType));
     }
 
     private Map<String, String> accountLabels(String project, String email) {
@@ -260,6 +284,13 @@ public class IamServiceAccountAuthorizationAdapter implements IamAuthorizationAd
         labels.put("unique_id", iamService.get().findServiceAccount(email).map(StoredServiceAccount::getUniqueId)
                 .orElse(""));
         return labels;
+    }
+
+    private static void putIfPresent(Map<String, Object> target, String key, JsonNode value) {
+        Object converted = AuditedMethod.value(value);
+        if (converted != null) {
+            target.put(key, converted);
+        }
     }
 
     private static void putText(Map<String, Object> target, String key, JsonNode value) {

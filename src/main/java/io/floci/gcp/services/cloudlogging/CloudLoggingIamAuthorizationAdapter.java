@@ -1,6 +1,7 @@
 package io.floci.gcp.services.cloudlogging;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.logging.v2.CreateLogMetricRequest;
 import com.google.logging.v2.CreateSinkRequest;
 import com.google.logging.v2.DeleteLogMetricRequest;
@@ -87,12 +88,12 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     }
 
     /**
-     * Sink creation, update and deletion in a project, as real entries record them: a {@code logging_sink}
+     * Sink creation, update and deletion in a project (Admin Activity), and GetSink (Data Access, ADMIN_READ), as real entries record them: a {@code logging_sink}
      * resource with an empty {@code destination} label, and the RPC request.
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
-        if (!Set.of("CreateSink", "UpdateSink", "DeleteSink").contains(operation.name())
+        if (!Set.of("CreateSink", "UpdateSink", "DeleteSink", "GetSink").contains(operation.name())
                 || !operation.resource().matches("projects/[^/]+/sinks/[^/]+")) {
             return Optional.empty();
         }
@@ -108,7 +109,7 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
             } else {
                 audited.put("sinkName", operation.resource());
             }
-            if (!"DeleteSink".equals(operation.name())) {
+            if (!Set.of("DeleteSink", "GetSink").contains(operation.name())) {
                 audited.put("sink", AuditedMethod.value(request.body()));
                 if (request.query().get("updateMask") != null) {
                     audited.put("updateMask", request.query().get("updateMask"));
@@ -123,7 +124,8 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
         labels.put("destination", "");
         labels.put("name", parts[3]);
         return Optional.of(new AuditedMethod("logging.googleapis.com", "google.logging.v2.ConfigServiceV2."
-                + operation.name(), operation.resource(), parent, "logging_sink", labels, audited, null));
+                + operation.name(), operation.resource(), parent, "logging_sink", labels, audited, null,
+                "GetSink".equals(operation.name()) ? PermissionType.ADMIN_READ : PermissionType.ADMIN_WRITE));
     }
 
     @Override

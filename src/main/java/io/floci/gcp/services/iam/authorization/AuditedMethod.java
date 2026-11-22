@@ -3,6 +3,7 @@ package io.floci.gcp.services.iam.authorization;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -14,12 +15,22 @@ import java.util.Map;
  * @param logParent the resource that owns the audit log, such as {@code projects/my-project}
  * @param policyResource the IAM policy a SetIamPolicy call changes, or null; its policy before and
  *        after the call gives the entry's {@code policyDelta} and {@code response}
+ * @param permissionType the type of the permission the method checks: {@code ADMIN_WRITE} methods write
+ *        Admin Activity entries, the other types Data Access entries when the policy's auditConfigs enable them
  */
 public record AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
         String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
-        String policyResource) {
+        String policyResource, PermissionType permissionType) {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** An Admin Activity method. */
+    public AuditedMethod(String serviceName, String methodName, String resourceName, String logParent,
+            String resourceType, Map<String, String> resourceLabels, Map<String, Object> request,
+            String policyResource) {
+        this(serviceName, methodName, resourceName, logParent, resourceType, resourceLabels, request, policyResource,
+                PermissionType.ADMIN_WRITE);
+    }
 
     /** A request object typed {@code type.googleapis.com/<protoType>}, starting from the given JSON fields. */
     public static Map<String, Object> request(String protoType, JsonNode fields) {
