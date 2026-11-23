@@ -18,16 +18,24 @@ final class SinkRouting {
     }
 
     List<StoredLogEntry> select(String parent, LogSink sink, List<StoredLogEntry> entries) {
+        Predicate<StoredLogEntry> routed = routes(sink);
+        return entries.stream()
+                .filter(entry -> belongsTo(parent, sink.getIncludeChildren(), entry.getLogName()) && routed.test(entry))
+                .toList();
+    }
+
+    /**
+     * "If the log entry matches the inclusion filter and at least one exclusion filter, then it isn't routed"
+     * (https://docs.cloud.google.com/logging/docs/routing/overview).
+     */
+    static Predicate<StoredLogEntry> routes(LogSink sink) {
         Predicate<StoredLogEntry> matches = LogEntryFilter.parse(sink.getFilter());
         for (LogExclusion exclusion : sink.getExclusionsList()) {
             if (!exclusion.getDisabled()) {
                 matches = matches.and(LogEntryFilter.parse(exclusion.getFilter()).negate());
             }
         }
-        Predicate<StoredLogEntry> routed = matches;
-        return entries.stream()
-                .filter(entry -> belongsTo(parent, sink.getIncludeChildren(), entry.getLogName()) && routed.test(entry))
-                .toList();
+        return matches;
     }
 
     private boolean belongsTo(String parent, boolean includeChildren, String logName) {

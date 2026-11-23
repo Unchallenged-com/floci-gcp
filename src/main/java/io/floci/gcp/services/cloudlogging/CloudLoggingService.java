@@ -27,7 +27,9 @@ import org.jboss.logging.Logger;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -158,8 +160,27 @@ public class CloudLoggingService {
             LOG.debugf("writeLogEntries dryRun=true validated %d entries", entries.size());
             return;
         }
+        Map<String, Map<String, Predicate<StoredLogEntry>>> routes = new HashMap<>();
+        Map<String, CloudLoggingBucketService.Retention> retentions = new HashMap<>();
         for (StoredLogEntry entry : entries) {
-            entryStore.put(key(entry), entry);
+            String project = owningProject(entry.getLogName());
+            if (project == null || sinkService == null || bucketService == null) {
+                entryStore.put(key(entry), entry);
+                continue;
+            }
+            List<String> buckets = new ArrayList<>();
+            routes.computeIfAbsent(project, sinkService::systemBucketRoutes).forEach((bucketId, routed) -> {
+                if (routed.test(entry) && retention(retentions, project, bucketId).retains(entryInstant(entry),
+                        Instant.parse(entry.getReceiveTimestamp()))) {
+                    buckets.add(bucketId);
+                }
+            });
+            // Entries no system sink routes are not stored; the project's other sinks and log-based metrics,
+            // "calculated from both included and excluded logs", still receive them.
+            if (!buckets.isEmpty()) {
+                entry.setBuckets(buckets);
+                entryStore.put(key(entry), entry);
+            }
         }
         if (sinkService != null) {
             sinkService.exportEntries(entries);
@@ -183,6 +204,7 @@ public class CloudLoggingService {
         }
         Predicate<StoredLogEntry> filterPredicate = LogEntryFilter.parse(filter);
         List<String> prefixes = resourceNames.stream().map(r -> r + "/logs/").collect(Collectors.toList());
+        Map<String, CloudLoggingBucketService.Retention> retentions = new HashMap<>();
 
         // "Entries with equal timestamps are returned in order of their insertId values."
         Comparator<StoredLogEntry> comparator = Comparator
@@ -196,6 +218,7 @@ public class CloudLoggingService {
         List<StoredLogEntry> matched = entryStore.scan(k -> true).stream()
                 .filter(e -> prefixes.stream().anyMatch(p -> e.getLogName().startsWith(p)))
                 .filter(filterPredicate)
+                .filter(entry -> retained(entry, retentions))
                 .filter(this::readableByCaller)
                 .sorted(comparator)
                 .collect(Collectors.toList());
@@ -241,6 +264,32 @@ public class CloudLoggingService {
                     "audited_resource", labels, request, null, PermissionType.DATA_READ),
                     List.of(new IamPermissionCheck("logging.logEntries.list", IamResource.project(resource))));
         }
+    }
+
+    /**
+     * entries.list: "Log entries with timestamps that are more than the logs retention period in the past [...] will
+     * not be available" (https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write). An entry is
+     * listed while one of the buckets it is stored in retains it.
+     */
+    private boolean retained(StoredLogEntry entry, Map<String, CloudLoggingBucketService.Retention> retentions) {
+        if (entry.getBuckets() == null || bucketService == null) {
+            return true;
+        }
+        String project = owningProject(entry.getLogName());
+        Instant received = Instant.parse(entry.getReceiveTimestamp());
+        return entry.getBuckets().stream().anyMatch(bucketId ->
+                retention(retentions, project, bucketId).retains(entryInstant(entry), received));
+    }
+
+    private CloudLoggingBucketService.Retention retention(Map<String, CloudLoggingBucketService.Retention> retentions,
+            String project, String bucketId) {
+        return retentions.computeIfAbsent(project + "/" + bucketId, k -> bucketService.retention(project, bucketId));
+    }
+
+    /** The {@code projects/{project}} a log name belongs to, or null for a folder, organization or billing log. */
+    private static String owningProject(String logName) {
+        int marker = logName.indexOf("/logs/");
+        return logName.startsWith("projects/") && marker > 0 ? logName.substring(0, marker) : null;
     }
 
     /**

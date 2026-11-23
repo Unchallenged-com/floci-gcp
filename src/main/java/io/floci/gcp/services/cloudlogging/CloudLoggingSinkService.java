@@ -23,10 +23,12 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 
 @ApplicationScoped
 public class CloudLoggingSinkService {
@@ -216,9 +218,31 @@ public class CloudLoggingSinkService {
             updated.setUpdateTime(timestamp());
             LogSink result = normalizeConfiguration(updated.build());
             validateDescriptionAndExclusions(result);
+            // The _Default bucket stores what this sink routes: a filter it cannot evaluate is refused, not stored.
+            SinkRouting.routes(result);
             sinks.put(name, stored(result, false));
             return result;
         }
+    }
+
+    /**
+     * The project's buckets its _Required and _Default sinks route to, by bucket ID, with the entries each routes:
+     * "every log sink in that resource independently evaluates it" (https://docs.cloud.google.com/logging/docs/routing/overview),
+     * and "if you disable the _Default sink, then no log entries are routed to the _Default bucket"
+     * (https://docs.cloud.google.com/logging/docs/export/configure_export_v2).
+     */
+    Map<String, Predicate<StoredLogEntry>> systemBucketRoutes(String project) {
+        Map<String, Predicate<StoredLogEntry>> routes = new LinkedHashMap<>();
+        for (String bucketId : List.of(REQUIRED, DEFAULT)) {
+            LogSink sink;
+            synchronized (sinkLock) {
+                sink = current(project + "/sinks/" + bucketId);
+            }
+            if (!sink.getDisabled()) {
+                routes.put(bucketId, SinkRouting.routes(sink));
+            }
+        }
+        return routes;
     }
 
     /** The stored sink, or a project's _Required or _Default sink as the project was created with it. */

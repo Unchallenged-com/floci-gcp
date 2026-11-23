@@ -260,11 +260,32 @@ project lists them, as it was created with them, until `_Default` is changed.
   entries, refused calls included with their status; `GetBucket` and `ListBuckets` are Data Access (`ADMIN_READ`)
   ([Cloud Logging audit logging](https://docs.cloud.google.com/logging/docs/audit-logging)). Bucket entries name an
   `audited_resource` (`service`, `method`, `project_id`), as a captured `UpdateBucket` entry does.
-- The system sinks only describe routing: entries are stored and listed whatever `_Default`'s filter, exclusions
-  and disabled flag, and its retention does not expire them. Folders, organizations and billing accounts have no
-  system buckets or sinks in the emulator.
+- A project's entries are stored in the buckets its system sinks route them to: "every log sink in that resource
+  independently evaluates" an entry, and "If the log entry matches the inclusion filter and at least one exclusion
+  filter, then it isn't routed" ([Routing and storage overview](https://docs.cloud.google.com/logging/docs/routing/overview)).
+  An entry `_Default`'s filter rejects or an active exclusion matches is not stored in `_Default`, and "if you disable
+  the `_Default` sink, then no log entries are routed to the `_Default` bucket"
+  ([Route logs to supported destinations](https://docs.cloud.google.com/logging/docs/export/configure_export_v2)).
+  `_Required` stores its audit logs whatever `_Default`'s configuration. An entry no system sink routes is not stored
+  and is not listed, but the project's other sinks still export it, and log-based metrics still count it:
+  "User-defined log-based metrics are calculated from both included and excluded logs"
+  ([Log-based metrics overview](https://docs.cloud.google.com/logging/docs/logs-based-metrics)). "Log sinks can't
+  retroactively route log entries": a change applies to the entries received after it. A `_Default` filter or
+  exclusion the emulator cannot evaluate is refused with `INVALID_ARGUMENT` instead of being stored.
+- Entries age out by their `timestamp`: "Log entries with timestamps that are more than the logs retention period in
+  the past [...] will not be available when calling entries.list. However, those log entries can still be exported
+  with LogSinks" ([entries.write](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write)). An
+  entry is listed while one of its buckets retains it. Shortening `_Default`'s retention hides older entries at once;
+  "there is a 7-day grace period in which expired logs aren't deleted", and "during this 7-day period, you can restore
+  full access by extending the bucket's retention period". "If you extend a bucket's retention period, then the
+  retention rules apply going forward and not retroactively": an entry that had aged out does not come back
+  ([Configure log buckets](https://docs.cloud.google.com/logging/docs/buckets)). Retention is enforced immediately,
+  where Cloud Logging's is "an eventually-consistent process".
+- Folders, organizations and billing accounts have no system buckets or sinks in the emulator: their entries are
+  stored and listed as they are received.
 
-Changes to `_Default` use `cloudlogging-buckets.json` and `cloudlogging-sinks.json` through `StorageFactory`.
+Changes to `_Default` use `cloudlogging-buckets.json`, `cloudlogging-bucket-retention.json` (the history of its
+retention changes) and `cloudlogging-sinks.json` through `StorageFactory`.
 
 ## GCS export
 

@@ -11,9 +11,12 @@ import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.core.common.ProtoJson;
 import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
+import io.floci.gcp.services.cloudlogging.model.StoredRetentionChange;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,18 +41,29 @@ public class CloudLoggingBucketService {
     private static final Set<String> MUTABLE_FIELDS = Set.of("description", "retention_days", "locked",
             "analytics_enabled", "restricted_fields", "index_configs", "cmek_settings");
     private static final Set<String> EMULATED_FIELDS = Set.of("description", "retention_days");
+    // "If you shorten the retention period of a log bucket, then there is a 7-day grace period in which expired
+    // logs aren't deleted" (https://docs.cloud.google.com/logging/docs/buckets).
+    private static final Duration GRACE_PERIOD = Duration.ofDays(7);
 
     private final StorageBackend<String, String> buckets;
+    private final StorageBackend<String, List<StoredRetentionChange>> retentionChanges;
+    private final Clock clock;
     private final Object bucketLock = new Object();
 
     @Inject
     public CloudLoggingBucketService(StorageFactory storageFactory) {
         this(storageFactory.createGlobal("logging", "cloudlogging-buckets.json",
-                new TypeReference<Map<String, String>>() {}));
+                new TypeReference<Map<String, String>>() {}),
+                storageFactory.createGlobal("logging", "cloudlogging-bucket-retention.json",
+                        new TypeReference<Map<String, List<StoredRetentionChange>>>() {}),
+                Clock.systemUTC());
     }
 
-    CloudLoggingBucketService(StorageBackend<String, String> buckets) {
+    CloudLoggingBucketService(StorageBackend<String, String> buckets,
+            StorageBackend<String, List<StoredRetentionChange>> retentionChanges, Clock clock) {
         this.buckets = buckets;
+        this.retentionChanges = retentionChanges;
+        this.clock = clock;
     }
 
     public ListBucketsResponse listBuckets(String parent, int pageSize, String pageToken) {
@@ -112,11 +126,62 @@ public class CloudLoggingBucketService {
                 if (requested.getRetentionDays() < 1 || requested.getRetentionDays() > 3650) {
                     throw GcpException.invalidArgument("Bucket retention must be between 1 and 3650 days");
                 }
+                if (requested.getRetentionDays() != updated.getRetentionDays()) {
+                    List<StoredRetentionChange> changes = new ArrayList<>(
+                            retentionChanges.get(key(project, bucketId)).orElse(List.of()));
+                    changes.add(new StoredRetentionChange(clock.millis(), requested.getRetentionDays()));
+                    retentionChanges.put(key(project, bucketId), changes);
+                }
                 updated.setRetentionDays(requested.getRetentionDays());
             }
             LogBucket result = updated.setUpdateTime(timestamp()).build();
             buckets.put(key(project, bucketId), ProtoJson.print(result));
             return result;
+        }
+    }
+
+    /** The retention of a project's {@code _Required} or {@code _Default} bucket, as of now. */
+    Retention retention(String project, String bucketId) {
+        synchronized (bucketLock) {
+            return new Retention(RETENTION_DAYS.get(bucketId),
+                    List.copyOf(retentionChanges.get(key(project, bucketId)).orElse(List.of())), clock.instant());
+        }
+    }
+
+    /**
+     * Whether a bucket still keeps an entry, from its retention changes. "Incoming log entries with timestamps that
+     * are more than the logs retention period in the past [...] are discarded"
+     * (https://docs.cloud.google.com/logging/docs/routing/overview); an entry older than the retention is not listed,
+     * and is deleted unless the grace period of a shortened retention keeps it until the retention is extended.
+     * "If you extend a bucket's retention period, then the retention rules apply going forward and not
+     * retroactively" (https://docs.cloud.google.com/logging/docs/buckets).
+     */
+    record Retention(int initialDays, List<StoredRetentionChange> changes, Instant now) {
+
+        boolean retains(Instant timestamp, Instant received) {
+            Instant graceEnd = Instant.MIN;
+            int days = initialDays;
+            Instant periodStart = received;
+            for (StoredRetentionChange change : changes) {
+                Instant changedAt = Instant.ofEpochMilli(change.changedAtMillis());
+                if (changedAt.isAfter(periodStart)) {
+                    Instant expired = max(periodStart, timestamp.plus(Duration.ofDays(days)));
+                    if (max(expired, graceEnd).isBefore(changedAt)) {
+                        return false;
+                    }
+                    periodStart = changedAt;
+                }
+                // An entry already past the retention when received is discarded, grace period or not.
+                if (change.retentionDays() < days && changedAt.isAfter(received)) {
+                    graceEnd = changedAt.plus(GRACE_PERIOD);
+                }
+                days = change.retentionDays();
+            }
+            return !timestamp.plus(Duration.ofDays(days)).isBefore(now);
+        }
+
+        private static Instant max(Instant a, Instant b) {
+            return a.isAfter(b) ? a : b;
         }
     }
 

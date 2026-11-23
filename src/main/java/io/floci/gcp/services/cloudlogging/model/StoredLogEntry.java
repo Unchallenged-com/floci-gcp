@@ -2,6 +2,7 @@ package io.floci.gcp.services.cloudlogging.model;
 
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
@@ -31,6 +32,12 @@ public class StoredLogEntry {
 
     /** Monotonic ingestion order, used for stable sorting and as the storage key suffix. */
     private long sequence;
+
+    /**
+     * The IDs of the project log buckets the entry is stored in, such as {@code _Default}; null for an entry
+     * outside a project's {@code _Required} and {@code _Default} buckets, which is always listed.
+     */
+    private List<String> buckets;
 
     public StoredLogEntry() {
         this.severity = "DEFAULT";
@@ -80,4 +87,7 @@ public class StoredLogEntry {
 
     public long getSequence() { return sequence; }
     public void setSequence(long sequence) { this.sequence = sequence; }
+
+    public List<String> getBuckets() { return buckets; }
+    public void setBuckets(List<String> buckets) { this.buckets = buckets; }
 }
