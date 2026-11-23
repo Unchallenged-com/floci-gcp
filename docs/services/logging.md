@@ -155,6 +155,8 @@ regex, and nested parentheses are not supported; unrecognized clauses are ignore
 - `ListLogs`
 - `DeleteLog`
 - `CreateSink`, `GetSink`, `ListSinks`, `UpdateSink`, `DeleteSink` over gRPC and REST JSON
+- `ListBuckets`, `GetBucket`, `UpdateBucket`, `DeleteBucket` for a project's `_Required` and `_Default` buckets over
+  gRPC and REST JSON (see [System buckets and sinks](#system-buckets-and-sinks))
 - `CreateLogMetric`, `GetLogMetric`, `ListLogMetrics`, `UpdateLogMetric`, `DeleteLogMetric` over gRPC and REST JSON
   (see [Log-based metrics](#log-based-metrics))
 
@@ -216,6 +218,55 @@ check runs inside the destination policy locks at delivery time.
 Sink state uses `cloudlogging-sinks.json` through `StorageFactory` and the configured global storage
 mode. Persistent, hybrid, and WAL storage retain configuration, writer identity, and deletion across
 restarts. Memory storage retains state only for the process lifetime.
+
+## System buckets and sinks
+
+Every project has a `_Required` and a `_Default` log bucket in `global`, and a sink of the same name routing to
+each ([Routing overview](https://docs.cloud.google.com/logging/docs/routing/overview)). They are not created: every
+project lists them, as it was created with them, until `_Default` is changed.
+
+| Operation | REST method and path |
+|---|---|
+| List | `GET /v2/projects/{project}/locations/{location}/buckets` (`-` for every location) |
+| Get | `GET /v2/projects/{project}/locations/global/buckets/{bucketId}` |
+| Update | `PATCH /v2/projects/{project}/locations/global/buckets/{bucketId}?updateMask=...` |
+| Delete | `DELETE /v2/projects/{project}/locations/global/buckets/{bucketId}` |
+
+- `_Required` keeps its entries 400 days and `_Default` 30 days
+  ([Quotas and limits](https://docs.cloud.google.com/logging/quotas)). Their descriptions are `Audit bucket` and
+  `Default bucket`, and `_Required` is `locked`, as real projects report them. Both are `ACTIVE` and have no
+  `createTime`, which "is not set for any of the default buckets" (`logging_config.proto`); `updateTime` appears once
+  `_Default` is updated.
+- `_Default`'s `retentionDays` (1 to 3650 days, [Configure log buckets](https://docs.cloud.google.com/logging/docs/buckets))
+  and `description` can be updated; the update mask is required. Its other mutable fields (`locked`,
+  `analyticsEnabled`, `restrictedFields`, `indexConfigs`, `cmekSettings`) fail with `UNIMPLEMENTED`.
+- "You can't change the retention period of the _Required log bucket": every update or deletion of `_Required` fails
+  with `FAILED_PRECONDITION` and "This bucket is locked. Locked buckets are immutable", the error of a locked bucket.
+  "You can't delete the system-created log buckets": deleting `_Default` fails with `FAILED_PRECONDITION`. No other
+  bucket exists; creating one is not supported. Buckets are listed `_Required` first.
+- `ListSinks` lists `_Required`, then `_Default`, then a project's own sinks. `_Required` routes the documented audit
+  logs, `LOG_ID("cloudaudit.googleapis.com/activity") OR ...`, and `_Default` everything else,
+  `NOT LOG_ID("cloudaudit.googleapis.com/activity") AND ...`. Neither has a writer identity: "Sinks that have a
+  destination that is a log bucket in the same project as the sink cannot have a writer_identity"
+  (`logging_config.proto`).
+- "You can't modify or delete the _Required log sink": its deletion fails with `PERMISSION_DENIED` and "Sink _Required
+  cannot be deleted", as Cloud Logging answers, and its updates with `PERMISSION_DENIED` and "Sink _Required cannot be
+  updated". "You can modify and disable the _Default log sink": its `filter`, `exclusions`, `disabled`, `description`
+  and `includeChildren` can be updated. Its deletion fails with `PERMISSION_DENIED` and "Sink _Default cannot be
+  deleted. Consider disabling instead". Changing its destination fails with `UNIMPLEMENTED`.
+- In `enforce` mode, bucket methods check `logging.buckets.list`, `get`, `update` and `delete` on the bucket (or the
+  parent location for list), granted by `roles/logging.viewer` and `roles/logging.privateLogViewer` (list and get)
+  and `roles/logging.configWriter` and `roles/logging.admin`
+  ([Logging roles](https://docs.cloud.google.com/iam/docs/roles-permissions/logging)).
+- `UpdateBucket` and `DeleteBucket`, and `UpdateSink` and `DeleteSink` on the system sinks, write Admin Activity
+  entries, refused calls included with their status; `GetBucket` and `ListBuckets` are Data Access (`ADMIN_READ`)
+  ([Cloud Logging audit logging](https://docs.cloud.google.com/logging/docs/audit-logging)). Bucket entries name an
+  `audited_resource` (`service`, `method`, `project_id`), as a captured `UpdateBucket` entry does.
+- The system sinks only describe routing: entries are stored and listed whatever `_Default`'s filter, exclusions
+  and disabled flag, and its retention does not expire them. Folders, organizations and billing accounts have no
+  system buckets or sinks in the emulator.
+
+Changes to `_Default` use `cloudlogging-buckets.json` and `cloudlogging-sinks.json` through `StorageFactory`.
 
 ## GCS export
 
@@ -559,5 +610,5 @@ services, are not written.
 
 `TailLogEntries` (streaming), `protoPayload` types other than AuditLog, `httpRequest`/`sourceLocation`/`split`
 fields, monitored-resource-descriptor catalog, log-based metric backfill,
-log buckets and other `ConfigServiceV2` methods, advanced filter operators, and retention/dedup
+log buckets other than `_Required` and `_Default`, and other `ConfigServiceV2` methods, advanced filter operators, and retention/dedup
 semantics.

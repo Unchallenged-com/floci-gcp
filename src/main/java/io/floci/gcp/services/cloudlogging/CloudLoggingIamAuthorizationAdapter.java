@@ -4,15 +4,19 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.google.cloud.audit.AuthorizationInfo.PermissionType;
 import com.google.logging.v2.CreateLogMetricRequest;
 import com.google.logging.v2.CreateSinkRequest;
+import com.google.logging.v2.DeleteBucketRequest;
 import com.google.logging.v2.DeleteLogMetricRequest;
 import com.google.logging.v2.DeleteLogRequest;
 import com.google.logging.v2.DeleteSinkRequest;
+import com.google.logging.v2.GetBucketRequest;
 import com.google.logging.v2.GetLogMetricRequest;
 import com.google.logging.v2.GetSinkRequest;
+import com.google.logging.v2.ListBucketsRequest;
 import com.google.logging.v2.ListLogEntriesRequest;
 import com.google.logging.v2.ListLogMetricsRequest;
 import com.google.logging.v2.ListLogsRequest;
 import com.google.logging.v2.ListSinksRequest;
+import com.google.logging.v2.UpdateBucketRequest;
 import com.google.logging.v2.UpdateLogMetricRequest;
 import com.google.logging.v2.UpdateSinkRequest;
 import com.google.logging.v2.WriteLogEntriesRequest;
@@ -26,6 +30,7 @@ import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.authorization.IamPermissionCheck;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -35,7 +40,11 @@ import java.util.Set;
 @ApplicationScoped
 public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdapter {
     private static final String PARENT = "(?:projects/[^/]+|organizations/[^/:]+)";
-    private static final String SINK = PARENT + "/sinks/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}";
+    private static final String SINK = PARENT + "/sinks/(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,99}|_Required|_Default)";
+    private static final String BUCKET = "projects/[^/]+/locations/[^/]+/buckets/[^/]+";
+    private static final Set<String> BUCKET_READ = Set.of("logging.buckets.get", "logging.buckets.list");
+    private static final Set<String> BUCKET_WRITE = Set.of("logging.buckets.get", "logging.buckets.list",
+            "logging.buckets.update", "logging.buckets.delete");
     private static final String METRIC = "projects/[^/]+/metrics/[^\\s]+";
     private static final Set<String> VIEWER = Set.of("logging.sinks.get", "logging.sinks.list",
             "logging.logMetrics.get", "logging.logMetrics.list", "logging.logEntries.list", "logging.logs.list");
@@ -59,8 +68,8 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
 
     @Override
     public Set<Class<?>> restControllers() {
-        return Set.of(CloudLoggingConfigHttpController.class, CloudLoggingMetricsHttpController.class,
-                CloudLoggingHttpController.class);
+        return Set.of(CloudLoggingConfigHttpController.class, CloudLoggingBucketHttpController.class,
+                CloudLoggingMetricsHttpController.class, CloudLoggingHttpController.class);
     }
 
     @Override
@@ -89,8 +98,19 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
                 return new IamOperation("DeleteLog", "projects/" + path.get("project"));
             }
             default -> {
-                // Sink and metric methods below.
+                // Bucket, sink and metric methods below.
             }
+        }
+        if (method.endsWith("Bucket") || method.endsWith("Buckets")) {
+            String parent = "projects/" + path.get("project") + "/locations/" + path.get("location");
+            String bucket = path.containsKey("bucketId") ? parent + "/buckets/" + path.get("bucketId") : parent;
+            return switch (method) {
+                case "listBuckets" -> new IamOperation("ListBuckets", parent);
+                case "getBucket" -> new IamOperation("GetBucket", bucket);
+                case "updateBucket" -> new IamOperation("UpdateBucket", bucket);
+                case "deleteBucket" -> new IamOperation("DeleteBucket", bucket);
+                default -> throw unsupported("REST method " + method);
+            };
         }
         if (method.endsWith("LogMetric") || method.endsWith("LogMetrics")) {
             String project = "projects/" + path.get("project");
@@ -128,6 +148,9 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
      */
     @Override
     public Optional<AuditedMethod> auditedMethod(IamOperation operation, AuditRequest request) {
+        if (operation.name().endsWith("Bucket") || operation.name().endsWith("Buckets")) {
+            return bucketAuditedMethod(operation, request);
+        }
         if (!Set.of("CreateSink", "UpdateSink", "DeleteSink", "GetSink").contains(operation.name())
                 || !operation.resource().matches("projects/[^/]+/sinks/[^/]+")) {
             return Optional.empty();
@@ -163,6 +186,42 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
                 "GetSink".equals(operation.name()) ? PermissionType.ADMIN_READ : PermissionType.ADMIN_WRITE));
     }
 
+    /**
+     * UpdateBucket and DeleteBucket in a project (Admin Activity), GetBucket and ListBuckets (Data Access,
+     * ADMIN_READ), per https://docs.cloud.google.com/logging/docs/audit-logging.
+     */
+    private static Optional<AuditedMethod> bucketAuditedMethod(IamOperation operation, AuditRequest request) {
+        String resource = operation.resource();
+        if (!resource.matches("projects/[^/]+/locations/[^/]+(?:/buckets/[^/]+)?")) {
+            return Optional.empty();
+        }
+        String[] parts = resource.split("/");
+        String requestType = "google.logging.v2." + operation.name() + "Request";
+        Map<String, Object> audited;
+        if (request.grpc()) {
+            audited = AuditedMethod.request(requestType, request.body());
+        } else {
+            audited = AuditedMethod.request(requestType, null);
+            audited.put("ListBuckets".equals(operation.name()) ? "parent" : "name", resource);
+            if ("UpdateBucket".equals(operation.name())) {
+                audited.put("bucket", AuditedMethod.value(request.body()));
+                if (request.query().get("updateMask") != null) {
+                    audited.put("updateMask", request.query().get("updateMask"));
+                }
+            }
+        }
+        String method = "google.logging.v2.ConfigServiceV2." + operation.name();
+        // A captured UpdateBucket entry names an audited_resource, not a logging_bucket.
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("method", method);
+        labels.put("project_id", parts[1]);
+        labels.put("service", "logging.googleapis.com");
+        PermissionType type = Set.of("UpdateBucket", "DeleteBucket").contains(operation.name())
+                ? PermissionType.ADMIN_WRITE : PermissionType.ADMIN_READ;
+        return Optional.of(new AuditedMethod("logging.googleapis.com", method, resource, "projects/" + parts[1],
+                "audited_resource", labels, audited, null, type));
+    }
+
     @Override
     public IamOperation grpcOperation(String method, Message request) {
         return switch (request) {
@@ -178,6 +237,10 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
             case GetSinkRequest value -> new IamOperation(method, value.getSinkName());
             case UpdateSinkRequest value -> new IamOperation(method, value.getSinkName());
             case DeleteSinkRequest value -> new IamOperation(method, value.getSinkName());
+            case ListBucketsRequest value -> new IamOperation(method, value.getParent());
+            case GetBucketRequest value -> new IamOperation(method, value.getName());
+            case UpdateBucketRequest value -> new IamOperation(method, value.getName());
+            case DeleteBucketRequest value -> new IamOperation(method, value.getName());
             case CreateLogMetricRequest value -> new IamOperation(method,
                     value.getParent() + "/metrics/" + value.getMetric().getName());
             case ListLogMetricsRequest value -> new IamOperation(method, value.getParent());
@@ -212,6 +275,10 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
             case "GetSink" -> "logging.sinks.get";
             case "UpdateSink" -> "logging.sinks.update";
             case "DeleteSink" -> "logging.sinks.delete";
+            case "ListBuckets" -> "logging.buckets.list";
+            case "GetBucket" -> "logging.buckets.get";
+            case "UpdateBucket" -> "logging.buckets.update";
+            case "DeleteBucket" -> "logging.buckets.delete";
             case "CreateLogMetric" -> "logging.logMetrics.create";
             case "ListLogMetrics" -> "logging.logMetrics.list";
             case "GetLogMetric" -> "logging.logMetrics.get";
@@ -222,6 +289,7 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
         IamResource target = switch (operation.name()) {
             case "ListSinks" -> listResource(operation.resource());
             case "ListLogMetrics" -> metricListResource(operation.resource());
+            case "ListBuckets" -> bucketListResource(operation.resource());
             default -> requireResource(operation.resource());
         };
         return List.of(new IamPermissionCheck(permission, target));
@@ -232,6 +300,11 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
         if (name != null && name.matches(METRIC)) {
             String project = name.substring(0, name.indexOf("/metrics/"));
             return Optional.of(new IamResource("logging.googleapis.com", "logging.googleapis.com/LogMetric",
+                    name, project, project, true));
+        }
+        if (name != null && name.matches(BUCKET)) {
+            String project = name.substring(0, name.indexOf("/locations/"));
+            return Optional.of(new IamResource("logging.googleapis.com", "logging.googleapis.com/LogBucket",
                     name, project, project, true));
         }
         if (name != null && name.matches(SINK)) {
@@ -245,8 +318,10 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
     @Override
     public Map<String, Set<String>> roles() {
         // https://docs.cloud.google.com/iam/docs/roles-permissions/logging
-        return Map.of("roles/logging.admin", ADMIN, "roles/logging.configWriter", CONFIG_WRITER,
-                "roles/logging.privateLogViewer", PRIVATE_VIEWER, "roles/logging.viewer", VIEWER,
+        return Map.of("roles/logging.admin", with(ADMIN, BUCKET_WRITE),
+                "roles/logging.configWriter", with(CONFIG_WRITER, BUCKET_WRITE),
+                "roles/logging.privateLogViewer", with(PRIVATE_VIEWER, BUCKET_READ),
+                "roles/logging.viewer", with(VIEWER, BUCKET_READ),
                 "roles/logging.logWriter", Set.of("logging.logEntries.create"));
     }
 
@@ -266,7 +341,14 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
 
     @Override
     public Map<String, Set<String>> basicRoles() {
-        return Map.of("roles/owner", ADMIN, "roles/editor", VIEWER, "roles/viewer", VIEWER);
+        return Map.of("roles/owner", with(ADMIN, BUCKET_WRITE), "roles/editor", with(VIEWER, BUCKET_READ),
+                "roles/viewer", with(VIEWER, BUCKET_READ));
+    }
+
+    private static Set<String> with(Set<String> permissions, Set<String> more) {
+        Set<String> all = new HashSet<>(permissions);
+        all.addAll(more);
+        return Set.copyOf(all);
     }
 
     /** The project of a log name such as {@code projects/p/logs/app}, or the name when it is not one. */
@@ -291,6 +373,15 @@ public class CloudLoggingIamAuthorizationAdapter implements IamAuthorizationAdap
             throw unsupported("log-based metric parent " + name);
         }
         return new IamResource("logging.googleapis.com", "logging.googleapis.com/LogMetric", name, name, name, true);
+    }
+
+    private IamResource bucketListResource(String name) {
+        if (!name.matches("projects/[^/]+/locations/[^/]+")) {
+            throw unsupported("log bucket parent " + name);
+        }
+        String project = name.substring(0, name.indexOf("/locations/"));
+        return new IamResource("logging.googleapis.com", "logging.googleapis.com/LogBucket", name, project, project,
+                true);
     }
 
     private IamResource listResource(String name) {

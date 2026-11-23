@@ -3,14 +3,18 @@ package io.floci.gcp.services.cloudlogging;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.logging.v2.CreateLogMetricRequest;
 import com.google.logging.v2.CreateSinkRequest;
+import com.google.logging.v2.DeleteBucketRequest;
 import com.google.logging.v2.DeleteLogMetricRequest;
 import com.google.logging.v2.DeleteSinkRequest;
+import com.google.logging.v2.GetBucketRequest;
 import com.google.logging.v2.GetLogMetricRequest;
 import com.google.logging.v2.GetSinkRequest;
+import com.google.logging.v2.ListBucketsRequest;
 import com.google.logging.v2.ListLogMetricsRequest;
 import com.google.logging.v2.ListSinksRequest;
 import com.google.logging.v2.LogMetric;
 import com.google.logging.v2.LogSink;
+import com.google.logging.v2.UpdateBucketRequest;
 import com.google.logging.v2.UpdateLogMetricRequest;
 import com.google.logging.v2.UpdateSinkRequest;
 import io.floci.gcp.services.iam.authorization.IamOperation;
@@ -37,7 +41,8 @@ class CloudLoggingIamAuthorizationAdapterServiceTest {
         Set<String> grpcHandlers = Arrays.stream(CloudLoggingConfigController.class.getDeclaredMethods())
                 .filter(method -> Modifier.isPublic(method.getModifiers()))
                 .map(Method::getName).collect(Collectors.toSet());
-        assertEquals(Set.of("createSink", "listSinks", "getSink", "updateSink", "deleteSink"), grpcHandlers);
+        assertEquals(Set.of("createSink", "listSinks", "getSink", "updateSink", "deleteSink", "listBuckets",
+                "getBucket", "updateBucket", "deleteBucket"), grpcHandlers);
 
         Map<String, String> parent = Map.of("parentType", "projects", "parentId", "test-project");
         Map<String, String> sink = Map.of("parentType", "projects", "parentId", "test-project", "sinkId", "one");
@@ -69,6 +74,40 @@ class CloudLoggingIamAuthorizationAdapterServiceTest {
         assertCheck(adapter.grpcOperation("DeleteSink", DeleteSinkRequest.newBuilder()
                 .setSinkName("organizations/123/sinks/one").build()), "logging.sinks.delete",
                 "organizations/123/sinks/one");
+    }
+
+    @Test
+    void everyBucketHandlerAndRpcMapsToItsBucketPermissionOnTheBucket() {
+        Set<String> handlers = Arrays.stream(CloudLoggingBucketHttpController.class.getDeclaredMethods())
+                .filter(method -> Modifier.isPublic(method.getModifiers()))
+                .map(Method::getName).collect(Collectors.toSet());
+        assertEquals(Set.of("listBuckets", "getBucket", "updateBucket", "deleteBucket"), handlers);
+        String parent = "projects/test-project/locations/global";
+        String bucket = parent + "/buckets/_Default";
+        Map<String, String> location = Map.of("project", "test-project", "location", "global");
+        Map<String, String> named = Map.of("project", "test-project", "location", "global", "bucketId", "_Default");
+        ObjectMapper mapper = new ObjectMapper();
+        assertBucketCheck(adapter.restOperation("listBuckets", location, mapper.createObjectNode()),
+                "logging.buckets.list", parent);
+        assertBucketCheck(adapter.restOperation("getBucket", named, mapper.createObjectNode()),
+                "logging.buckets.get", bucket);
+        assertBucketCheck(adapter.restOperation("updateBucket", named, mapper.createObjectNode()),
+                "logging.buckets.update", bucket);
+        assertBucketCheck(adapter.restOperation("deleteBucket", named, mapper.createObjectNode()),
+                "logging.buckets.delete", bucket);
+        assertBucketCheck(adapter.grpcOperation("ListBuckets", ListBucketsRequest.newBuilder().setParent(parent)
+                .build()), "logging.buckets.list", parent);
+        assertBucketCheck(adapter.grpcOperation("GetBucket", GetBucketRequest.newBuilder().setName(bucket).build()),
+                "logging.buckets.get", bucket);
+        assertBucketCheck(adapter.grpcOperation("UpdateBucket", UpdateBucketRequest.newBuilder().setName(bucket)
+                .build()), "logging.buckets.update", bucket);
+        assertBucketCheck(adapter.grpcOperation("DeleteBucket", DeleteBucketRequest.newBuilder().setName(bucket)
+                .build()), "logging.buckets.delete", bucket);
+        assertEquals("projects/test-project", adapter.checks(adapter.grpcOperation("GetBucket",
+                GetBucketRequest.newBuilder().setName(bucket).build())).getFirst().resource().policyResource());
+        assertCheck(adapter.grpcOperation("UpdateSink", UpdateSinkRequest.newBuilder()
+                .setSinkName("projects/test-project/sinks/_Default").build()), "logging.sinks.update",
+                "projects/test-project/sinks/_Default");
     }
 
     @Test
@@ -144,6 +183,12 @@ class CloudLoggingIamAuthorizationAdapterServiceTest {
         assertEquals(permission, adapter.checks(operation).getFirst().permission());
         assertEquals(resource, adapter.checks(operation).getFirst().resource().name());
         assertEquals("logging.googleapis.com/LogMetric", adapter.checks(operation).getFirst().resource().type());
+    }
+
+    private void assertBucketCheck(IamOperation operation, String permission, String resource) {
+        assertEquals(permission, adapter.checks(operation).getFirst().permission());
+        assertEquals(resource, adapter.checks(operation).getFirst().resource().name());
+        assertEquals("logging.googleapis.com/LogBucket", adapter.checks(operation).getFirst().resource().type());
     }
 
     private void assertCheck(IamOperation operation, String permission, String resource) {

@@ -21,9 +21,11 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 @ApplicationScoped
@@ -37,6 +39,23 @@ public class CloudLoggingSinkService {
             .addPaths("destination").addPaths("filter").addPaths("include_children").build();
 
     private static final String STORAGE_PREFIX = "storage.googleapis.com/";
+
+    // Every project has the _Required and _Default sinks, routing to its buckets of the same name; their filters
+    // are the documented ones (https://docs.cloud.google.com/logging/docs/routing/overview).
+    private static final String REQUIRED = CloudLoggingBucketService.REQUIRED;
+    private static final String DEFAULT = CloudLoggingBucketService.DEFAULT;
+    // The log IDs the _Required sink routes, whose entries cannot be deleted.
+    static final List<String> REQUIRED_LOG_IDS = List.of("cloudaudit.googleapis.com/activity",
+            "externalaudit.googleapis.com/activity", "cloudaudit.googleapis.com/system_event",
+            "externalaudit.googleapis.com/system_event", "cloudaudit.googleapis.com/access_transparency",
+            "externalaudit.googleapis.com/access_transparency");
+    private static final String REQUIRED_FILTER = String.join(" OR ",
+            REQUIRED_LOG_IDS.stream().map(id -> "LOG_ID(\"" + id + "\")").toList());
+    private static final String DEFAULT_FILTER = String.join(" AND ",
+            REQUIRED_LOG_IDS.stream().map(id -> "NOT LOG_ID(\"" + id + "\")").toList());
+    // "You can modify and disable the _Default log sink": these are the changes emulated.
+    private static final Set<String> DEFAULT_SINK_FIELDS = Set.of("filter", "description", "disabled",
+            "exclusions", "include_children");
 
     private final StorageBackend<String, StoredLogSink> sinks;
     private final CloudLoggingGcsExporter exporter;
@@ -96,20 +115,26 @@ public class CloudLoggingSinkService {
     public LogSink getSink(String name) {
         validateSinkName(name);
         synchronized (sinkLock) {
-            return read(requireSink(name));
+            return current(name);
         }
     }
 
     public ListSinksResponse listSinks(String parent, int pageSize, String pageToken) {
         validateParent(parent);
         synchronized (sinkLock) {
-            List<String> keys = sinks.keys().stream().filter(key -> key.startsWith(parent + "/sinks/"))
-                    .sorted().toList();
+            // Real projects list _Required, then _Default, before their own sinks.
+            List<String> keys = new ArrayList<>();
+            if (parent.startsWith("projects/")) {
+                keys.add(parent + "/sinks/" + REQUIRED);
+                keys.add(parent + "/sinks/" + DEFAULT);
+            }
+            keys.addAll(sinks.keys().stream().filter(key -> key.startsWith(parent + "/sinks/"))
+                    .filter(key -> !isSystemSink(key)).sorted().toList());
             int boundedPageSize = pageSize > 0 ? Math.min(pageSize, keys.size()) : keys.size();
             PageToken.Page<String> page = PageToken.paginate(keys, boundedPageSize, pageToken);
             ListSinksResponse.Builder response = ListSinksResponse.newBuilder();
             for (String key : page.items()) {
-                response.addSinks(read(requireSink(key)));
+                response.addSinks(current(key));
             }
             if (page.nextPageToken() != null) {
                 response.setNextPageToken(page.nextPageToken());
@@ -131,6 +156,9 @@ public class CloudLoggingSinkService {
                     || path.equals("bigquery_options.uses_timestamp_column_partitioning")) {
                 throw GcpException.invalidArgument("Invalid sink update mask path: " + path);
             }
+        }
+        if (isSystemSink(name)) {
+            return updateSystemSink(name, requested, mask);
         }
         synchronized (sinkLock) {
             StoredLogSink stored = requireSink(name);
@@ -156,10 +184,71 @@ public class CloudLoggingSinkService {
 
     public void deleteSink(String name) {
         validateSinkName(name);
+        if (isSystemSink(name)) {
+            throw systemSinkRefusal(name, true);
+        }
         synchronized (sinkLock) {
             requireSink(name);
             sinks.delete(name);
         }
+    }
+
+    /**
+     * The _Default sink's filter, exclusions, description and disabled flag change; its destination stays the
+     * project's _Default bucket. The _Required sink cannot change.
+     */
+    private LogSink updateSystemSink(String name, LogSink requested, FieldMask mask) {
+        if (name.endsWith("/sinks/" + REQUIRED)) {
+            throw systemSinkRefusal(name, false);
+        }
+        synchronized (sinkLock) {
+            LogSink current = current(name);
+            LogSink.Builder updated = current.toBuilder();
+            FieldMaskUtil.merge(mask, requested, updated, new FieldMaskUtil.MergeOptions()
+                    .setReplaceRepeatedFields(true).setReplaceMessageFields(true));
+            for (String path : mask.getPathsList()) {
+                String root = path.split("\\.", 2)[0];
+                if (!DEFAULT_SINK_FIELDS.contains(root) && !(root.equals("destination")
+                        && updated.getDestination().equals(current.getDestination()))) {
+                    throw GcpException.unimplemented("Changing the _Default sink's " + root + " is not supported");
+                }
+            }
+            updated.setUpdateTime(timestamp());
+            LogSink result = normalizeConfiguration(updated.build());
+            validateDescriptionAndExclusions(result);
+            sinks.put(name, stored(result, false));
+            return result;
+        }
+    }
+
+    /** The stored sink, or a project's _Required or _Default sink as the project was created with it. */
+    private LogSink current(String name) {
+        Optional<StoredLogSink> stored = sinks.get(name);
+        if (stored.isPresent()) {
+            return read(stored.get());
+        }
+        if (!isSystemSink(name)) {
+            throw GcpException.notFound("Sink not found: " + name);
+        }
+        String parent = name.substring(0, name.indexOf("/sinks/"));
+        String sinkId = name.substring(name.lastIndexOf('/') + 1);
+        // A sink routing to a log bucket of its own project has no writer identity (logging_config.proto).
+        return LogSink.newBuilder().setName(sinkId)
+                .setDestination("logging.googleapis.com/" + parent + "/locations/global/buckets/" + sinkId)
+                .setFilter(REQUIRED.equals(sinkId) ? REQUIRED_FILTER : DEFAULT_FILTER).build();
+    }
+
+    private static boolean isSystemSink(String name) {
+        return name.startsWith("projects/")
+                && (name.endsWith("/sinks/" + REQUIRED) || name.endsWith("/sinks/" + DEFAULT));
+    }
+
+    /** The errors real projects return when deleting a system sink, also used for changing _Required. */
+    private static GcpException systemSinkRefusal(String name, boolean delete) {
+        if (name.endsWith("/sinks/" + DEFAULT)) {
+            return GcpException.permissionDenied("Sink _Default cannot be deleted. Consider disabling instead");
+        }
+        return GcpException.permissionDenied("Sink _Required cannot be " + (delete ? "deleted" : "updated"));
     }
 
     private StoredLogSink requireSink(String name) {
@@ -241,7 +330,9 @@ public class CloudLoggingSinkService {
         }
         String parent = parts[0] + "/" + parts[1];
         validateParent(parent);
-        validateSinkId(parts[3]);
+        if (!isSystemSink(name)) {
+            validateSinkId(parts[3]);
+        }
         return parent;
     }
 
@@ -254,6 +345,10 @@ public class CloudLoggingSinkService {
                 + "|bigquery\\.googleapis\\.com/projects/[^/\\s]+/datasets/[^/\\s]+)")) {
             throw GcpException.invalidArgument("Invalid sink destination: " + sink.getDestination());
         }
+        validateDescriptionAndExclusions(sink);
+    }
+
+    private static void validateDescriptionAndExclusions(LogSink sink) {
         if (sink.getDescription().length() > 8000) {
             throw GcpException.invalidArgument("Sink description must not exceed 8000 characters");
         }

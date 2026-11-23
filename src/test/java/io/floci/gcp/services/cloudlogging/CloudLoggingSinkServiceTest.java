@@ -66,7 +66,8 @@ class CloudLoggingSinkServiceTest {
         assertEquals(created.getCreateTime(), updated.getCreateTime());
         service.deleteSink(NAME);
         assertEquals(Status.Code.NOT_FOUND, assertThrows(GcpException.class, () -> service.getSink(NAME)).getGrpcCode());
-        assertEquals(1, service.listSinks("projects/123456789", 0, null).getSinksCount());
+        assertEquals(List.of("_Required", "_Default", "workspace-events"), service.listSinks("projects/123456789", 0, null)
+                .getSinksList().stream().map(LogSink::getName).toList());
     }
 
     @Test

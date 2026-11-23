@@ -31,7 +31,6 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
@@ -41,12 +40,7 @@ import java.util.stream.Collectors;
 public class CloudLoggingService {
 
     private static final Logger LOG = Logger.getLogger(CloudLoggingService.class);
-    // The _Required sink's inclusion filter (https://docs.cloud.google.com/logging/docs/routing/overview).
     private static final String PRIVATE_LOG_ENTRIES_LIST = "logging.privateLogEntries.list";
-    private static final Set<String> REQUIRED_LOG_IDS = Set.of("cloudaudit.googleapis.com/activity",
-            "externalaudit.googleapis.com/activity", "cloudaudit.googleapis.com/system_event",
-            "externalaudit.googleapis.com/system_event", "cloudaudit.googleapis.com/access_transparency",
-            "externalaudit.googleapis.com/access_transparency");
 
     private final StorageBackend<String, StoredLogEntry> entryStore;
     private final AtomicLong sequence = new AtomicLong(0);
@@ -55,6 +49,7 @@ public class CloudLoggingService {
     private final EmulatorConfig config;
     private final GrpcServerManager grpcServerManager;
     private final CloudLoggingSinkService sinkService;
+    private final CloudLoggingBucketService bucketService;
     private final CloudLoggingMetricService metricService;
     private final Instance<AuditTrail> auditTrail;
     private final Instance<IamAuthorizationService> authorization;
@@ -62,12 +57,13 @@ public class CloudLoggingService {
     @Inject
     public CloudLoggingService(ServiceRegistry serviceRegistry, EmulatorConfig config,
             StorageFactory storageFactory, GrpcServerManager grpcServerManager, CloudLoggingSinkService sinkService,
-            CloudLoggingMetricService metricService, Instance<AuditTrail> auditTrail,
+            CloudLoggingBucketService bucketService, CloudLoggingMetricService metricService, Instance<AuditTrail> auditTrail,
             Instance<IamAuthorizationService> authorization) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.sinkService = sinkService;
+        this.bucketService = bucketService;
         this.metricService = metricService;
         this.auditTrail = auditTrail;
         this.authorization = authorization;
@@ -81,6 +77,7 @@ public class CloudLoggingService {
         this.config = null;
         this.grpcServerManager = null;
         this.sinkService = null;
+        this.bucketService = null;
         this.metricService = null;
         this.auditTrail = null;
         this.authorization = null;
@@ -92,14 +89,15 @@ public class CloudLoggingService {
                 .storageKey("logging")
                 .protocol(ServiceProtocol.GRPC)
                 .resourceClasses(CloudLoggingController.class, CloudLoggingConfigController.class,
-                        CloudLoggingConfigHttpController.class, CloudLoggingMetricsController.class,
+                        CloudLoggingConfigHttpController.class, CloudLoggingBucketHttpController.class,
+                        CloudLoggingMetricsController.class,
                         CloudLoggingMetricsHttpController.class)
                 .api("logging.googleapis.com", "Cloud Logging API", CloudLoggingHttpController.class)
                 .usageAdapter(new CloudLoggingServiceUsageAdapter())
                 .build());
         grpcServerManager.bind(new CloudLoggingController(this));
         if (config.services().logging().enabled()) {
-            grpcServerManager.bind(new CloudLoggingConfigController(sinkService));
+            grpcServerManager.bind(new CloudLoggingConfigController(sinkService, bucketService));
             grpcServerManager.bind(new CloudLoggingMetricsController(metricService));
         }
     }
@@ -274,7 +272,7 @@ public class CloudLoggingService {
     }
 
     public void deleteLog(String logName) {
-        if (logName != null && REQUIRED_LOG_IDS.contains(logId(logName))) {
+        if (logName != null && CloudLoggingSinkService.REQUIRED_LOG_IDS.contains(logId(logName))) {
             // logs.delete "Deletes all the log entries in a log for the global _Default Log Bucket"; these logs
             // are routed to the _Required bucket, whose entries cannot be deleted.
             throw GcpException.invalidArgument("Log entries in the _Required bucket cannot be deleted: " + logName);

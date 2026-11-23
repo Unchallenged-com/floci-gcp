@@ -20,6 +20,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -59,7 +60,8 @@ class CloudLoggingSinkDisabledIntegrationTest {
                     .setUpdateMask(FieldMask.newBuilder().addPaths("disabled")).build()));
             assertUnimplemented(() -> client.deleteSink(DeleteSinkRequest.newBuilder().setSinkName(name).build()));
             assertEquals(existing, sinks.getSink(name));
-            assertEquals(1, sinks.listSinks(parent, 100, null).getSinksCount());
+            assertEquals(List.of("_Required", "_Default", "existing"), sinks.listSinks(parent, 100, null)
+                    .getSinksList().stream().map(LogSink::getName).toList());
         } finally {
             channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
             sinks.deleteSink(name);
