@@ -18,6 +18,7 @@ import static io.floci.gcp.services.cloudlogging.AuditLogIntegrationTest.payload
 import static io.floci.gcp.services.cloudlogging.AuditLogIntegrationTest.project;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 @QuarkusTest
 class CloudLoggingDefaultBucketRoutingIntegrationTest {
@@ -126,6 +127,60 @@ class CloudLoggingDefaultBucketRoutingIntegrationTest {
             pubsub.deleteSubscription(subscription);
             pubsub.deleteTopic(topic);
         }
+    }
+
+    @Test
+    void bucketScopedMetricsCountOnlyTheEntriesTheirBucketStores() {
+        String project = project();
+        String parent = "projects/" + project;
+        createMetric(parent, "all_app", null);
+        createMetric(parent, "default_app", parent + "/locations/global/buckets/_Default");
+        createMetric(parent, "required_app", parent + "/locations/global/buckets/_Required");
+        patchDefaultSink(project, "exclusions", Map.of(
+                "exclusions", List.of(Map.of("name", "debug", "filter", "severity<=DEBUG"))));
+        Instant start = Instant.now().minusSeconds(120);
+        Instant now = Instant.now();
+
+        write(project, "app",
+                entry("INFO", "stored", null),
+                entry("DEBUG", "excluded", null),
+                entry("INFO", "past-retention", now.minus(40, ChronoUnit.DAYS)),
+                entry("INFO", "two-days-ahead", now.plus(2, ChronoUnit.DAYS)));
+
+        assertEquals(List.of("stored"), texts(project, "app"));
+        // "User-defined log-based metrics are calculated from both included and excluded logs."
+        assertEquals(4L, count(parent, "all_app", start));
+        // "For bucket-scoped metrics, the log entry is stored in the log bucket where the log-based metric is defined."
+        assertEquals(1L, count(parent, "default_app", start));
+        assertEquals(0L, count(parent, "required_app", start));
+    }
+
+    private static void createMetric(String parent, String name, String bucketName) {
+        Map<String, Object> metric = new LinkedHashMap<>();
+        metric.put("name", name);
+        metric.put("filter", "LOG_ID(\"app\")");
+        if (bucketName != null) {
+            metric.put("bucketName", bucketName);
+        }
+        given().contentType("application/json").body(metric).post("/v2/" + parent + "/metrics").then().statusCode(200);
+    }
+
+    private static long count(String parent, String metric, Instant start) {
+        JsonPath series = given()
+                .queryParam("filter", "metric.type=\"logging.googleapis.com/user/" + metric + "\"")
+                .queryParam("interval.startTime", start.toString())
+                .queryParam("interval.endTime", Instant.now().plusSeconds(60).toString())
+                .get("/v3/" + parent + "/timeSeries").then().statusCode(200).extract().jsonPath();
+        List<Map<String, Object>> all = series.getList("timeSeries");
+        long total = 0;
+        for (int i = 0; all != null && i < all.size(); i++) {
+            List<Object> points = series.getList("timeSeries[" + i + "].points");
+            assertNotNull(points, series.prettify());
+            for (int p = 0; p < points.size(); p++) {
+                total += Long.parseLong(series.getString("timeSeries[" + i + "].points[" + p + "].value.int64Value"));
+            }
+        }
+        return total;
     }
 
     private static Map<String, Object> entry(String severity, String text, Instant timestamp) {

@@ -164,7 +164,8 @@ public class CloudLoggingMetricService {
                     try {
                         LogMetric metric = read(require(key));
                         if (!metric.getDisabled()) {
-                            recorder.record(group.getKey(), key, metric, group.getValue());
+                            recorder.record(group.getKey(), key, metric,
+                                    counted(group.getKey(), metric, group.getValue()));
                         }
                     } catch (RuntimeException e) {
                         LOG.warnf(e, "Log-based metric %s failed to record entries", key);
@@ -172,6 +173,24 @@ public class CloudLoggingMetricService {
                 }
             }
         }
+    }
+
+    /**
+     * "User-defined log-based metrics are calculated from both included and excluded logs", while "for bucket-scoped
+     * metrics, the log entry is stored in the log bucket where the log-based metric is defined"
+     * (https://docs.cloud.google.com/logging/docs/logs-based-metrics). A project's buckets are in {@code global}.
+     */
+    private static List<StoredLogEntry> counted(String project, LogMetric metric, List<StoredLogEntry> entries) {
+        if (metric.getBucketName().isEmpty()) {
+            return entries;
+        }
+        String prefix = project + "/locations/global/buckets/";
+        if (!metric.getBucketName().startsWith(prefix)) {
+            return List.of();
+        }
+        String bucketId = metric.getBucketName().substring(prefix.length());
+        return entries.stream().filter(entry -> entry.getBuckets() != null && entry.getBuckets().contains(bucketId))
+                .toList();
     }
 
     // ── Validation ────────────────────────────────────────────────────────

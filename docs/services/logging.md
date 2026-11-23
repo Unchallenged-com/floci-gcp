@@ -267,9 +267,10 @@ project lists them, as it was created with them, until `_Default` is changed.
   the `_Default` sink, then no log entries are routed to the `_Default` bucket"
   ([Route logs to supported destinations](https://docs.cloud.google.com/logging/docs/export/configure_export_v2)).
   `_Required` stores its audit logs whatever `_Default`'s configuration. An entry no system sink routes is not stored
-  and is not listed, but the project's other sinks still export it, and log-based metrics still count it:
-  "User-defined log-based metrics are calculated from both included and excluded logs"
-  ([Log-based metrics overview](https://docs.cloud.google.com/logging/docs/logs-based-metrics)). "Log sinks can't
+  and is not listed, but the project's other sinks still export it, and project-scoped log-based metrics still
+  count it: "User-defined log-based metrics are calculated from both included and excluded logs"
+  ([Log-based metrics overview](https://docs.cloud.google.com/logging/docs/logs-based-metrics)); a bucket-scoped
+  metric counts only what its bucket stores (see [Log-based metrics](#log-based-metrics)). "Log sinks can't
   retroactively route log entries": a change applies to the entries received after it. A `_Default` filter or
   exclusion the emulator cannot evaluate is refused with `INVALID_ARGUMENT` instead of being stored.
 - Entries age out by their `timestamp`: "Log entries with timestamps that are more than the logs retention period in
@@ -285,8 +286,8 @@ project lists them, as it was created with them, until `_Default` is changed.
   ([Routing and storage overview](https://docs.cloud.google.com/logging/docs/routing/overview)): no bucket stores an
   entry whose `timestamp` is more than 24 hours after its `receiveTimestamp`, so it is not listed, but "those log
   entries can still be exported with LogSinks"
-  ([entries.write](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write)) and log-based
-  metrics count it. This applies to folder, organization and billing-account entries too.
+  ([entries.write](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write)) and project-scoped
+  log-based metrics count it. This applies to folder, organization and billing-account entries too.
 - Folders, organizations and billing accounts have no system buckets or sinks in the emulator: their entries are
   stored and listed as they are received, unless they are more than 24 hours in the future.
 
@@ -515,8 +516,15 @@ Validation follows the
   with whole numbers (also inside objects and lists) written as integers over both gRPC and REST. A
   distribution needs `valueExtractor` and `bucketOptions` (linear, exponential or explicit), with at
   most 200 buckets counting the underflow and overflow buckets.
-- `bucketName` is stored and must name a bucket in the metric's project; log buckets themselves
-  are not emulated, so it does not scope what the metric counts.
+- `bucketName` must name a bucket in the metric's project. A metric without it is project-scoped and
+  counts every entry of its project its filter matches, those no bucket stores included: "User-defined
+  log-based metrics are calculated from both included and excluded logs". A metric with it is
+  bucket-scoped and counts only the entries stored in that bucket: "For bucket-scoped metrics, the log
+  entry is stored in the log bucket where the log-based metric is defined"
+  ([Log-based metrics overview](https://docs.cloud.google.com/logging/docs/logs-based-metrics)). Only
+  `projects/{project}/locations/global/buckets/_Required` and `_Default` store entries (see
+  [System buckets and sinks](#system-buckets-and-sinks)); a metric scoped to any other bucket counts
+  nothing.
 
 ### Points in Cloud Monitoring
 
