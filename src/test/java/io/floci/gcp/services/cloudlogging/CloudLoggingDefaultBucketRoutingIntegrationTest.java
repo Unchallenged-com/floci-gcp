@@ -1,6 +1,9 @@
 package io.floci.gcp.services.cloudlogging;
 
+import io.floci.gcp.services.pubsub.PubSubService;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.json.JsonPath;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -25,6 +28,9 @@ class CloudLoggingDefaultBucketRoutingIntegrationTest {
             + "NOT LOG_ID(\"externalaudit.googleapis.com/system_event\") AND "
             + "NOT LOG_ID(\"cloudaudit.googleapis.com/access_transparency\") AND "
             + "NOT LOG_ID(\"externalaudit.googleapis.com/access_transparency\")";
+
+    @Inject
+    PubSubService pubsub;
 
     @Test
     void defaultSinkFilterAndExclusionsDecideWhatTheDefaultBucketStores() {
@@ -89,6 +95,37 @@ class CloudLoggingDefaultBucketRoutingIntegrationTest {
         // Extending the retention is not retroactive.
         patchRetention(project, 60);
         assertEquals(List.of("ten-days", "two-days"), texts(project, "app"));
+    }
+
+    @Test
+    void entriesMoreThanADayAheadAreNotListedButAreExported() {
+        String project = project();
+        String topic = "projects/" + project + "/topics/export";
+        String subscription = "projects/" + project + "/subscriptions/export";
+        pubsub.createTopic(topic);
+        pubsub.createSubscription(subscription, topic, 10);
+        given().queryParam("uniqueWriterIdentity", true).contentType("application/json")
+                .body(Map.of("name", "export", "destination", "pubsub.googleapis.com/" + topic,
+                        "filter", "LOG_ID(\"app\")"))
+                .post("/v2/projects/" + project + "/sinks").then().statusCode(200);
+        Instant now = Instant.now();
+        try {
+            write(project, "app",
+                    entry("INFO", "now", null),
+                    entry("INFO", "within-a-day", now.plus(23, ChronoUnit.HOURS)),
+                    entry("INFO", "two-days-ahead", now.plus(2, ChronoUnit.DAYS)));
+
+            assertEquals(List.of("now", "within-a-day"), texts(project, "app"));
+            assertEquals(List.of("now", "two-days-ahead", "within-a-day"),
+                    pubsub.pull(subscription, 10).stream()
+                            .map(message -> new JsonPath(message.getMessage().getData().toStringUtf8())
+                                    .getString("textPayload"))
+                            .sorted().toList());
+        } finally {
+            given().delete("/v2/projects/" + project + "/sinks/export").then().statusCode(200);
+            pubsub.deleteSubscription(subscription);
+            pubsub.deleteTopic(topic);
+        }
     }
 
     private static Map<String, Object> entry(String severity, String text, Instant timestamp) {

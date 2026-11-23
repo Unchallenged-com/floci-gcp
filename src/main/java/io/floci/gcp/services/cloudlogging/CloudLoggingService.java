@@ -26,6 +26,7 @@ import org.jboss.logging.Logger;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -45,6 +46,7 @@ public class CloudLoggingService {
     private static final String PRIVATE_LOG_ENTRIES_LIST = "logging.privateLogEntries.list";
     /** entries.list pageSize: "Default is 50. If the value is negative, the request is rejected." */
     private static final int DEFAULT_PAGE_SIZE = 50;
+    private static final Duration MAX_AHEAD_OF_RECEIPT = Duration.ofHours(24);
 
     private final StorageBackend<String, StoredLogEntry> entryStore;
     private final AtomicLong sequence = new AtomicLong(0);
@@ -163,6 +165,9 @@ public class CloudLoggingService {
         Map<String, Map<String, Predicate<StoredLogEntry>>> routes = new HashMap<>();
         Map<String, CloudLoggingBucketService.Retention> retentions = new HashMap<>();
         for (StoredLogEntry entry : entries) {
+            if (tooFarAhead(entry)) {
+                continue;
+            }
             String project = owningProject(entry.getLogName());
             if (project == null || sinkService == null || bucketService == null) {
                 entryStore.put(key(entry), entry);
@@ -279,6 +284,16 @@ public class CloudLoggingService {
         Instant received = Instant.parse(entry.getReceiveTimestamp());
         return entry.getBuckets().stream().anyMatch(bucketId ->
                 retention(retentions, project, bucketId).retains(entryInstant(entry), received));
+    }
+
+    /**
+     * "Incoming log entries with timestamps that are [...] more than 24 hours in the future are discarded"
+     * (https://docs.cloud.google.com/logging/docs/routing/overview): no bucket stores them, so they "will not be
+     * available when calling entries.list. However, those log entries can still be exported with LogSinks"
+     * (https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write).
+     */
+    private static boolean tooFarAhead(StoredLogEntry entry) {
+        return entryInstant(entry).isAfter(Instant.parse(entry.getReceiveTimestamp()).plus(MAX_AHEAD_OF_RECEIPT));
     }
 
     private CloudLoggingBucketService.Retention retention(Map<String, CloudLoggingBucketService.Retention> retentions,

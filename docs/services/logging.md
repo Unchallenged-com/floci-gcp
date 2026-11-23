@@ -281,8 +281,14 @@ project lists them, as it was created with them, until `_Default` is changed.
   retention rules apply going forward and not retroactively": an entry that had aged out does not come back
   ([Configure log buckets](https://docs.cloud.google.com/logging/docs/buckets)). Retention is enforced immediately,
   where Cloud Logging's is "an eventually-consistent process".
+- "Incoming log entries with timestamps that are [...] more than 24 hours in the future are discarded"
+  ([Routing and storage overview](https://docs.cloud.google.com/logging/docs/routing/overview)): no bucket stores an
+  entry whose `timestamp` is more than 24 hours after its `receiveTimestamp`, so it is not listed, but "those log
+  entries can still be exported with LogSinks"
+  ([entries.write](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write)) and log-based
+  metrics count it. This applies to folder, organization and billing-account entries too.
 - Folders, organizations and billing accounts have no system buckets or sinks in the emulator: their entries are
-  stored and listed as they are received.
+  stored and listed as they are received, unless they are more than 24 hours in the future.
 
 Changes to `_Default` use `cloudlogging-buckets.json`, `cloudlogging-bucket-retention.json` (the history of its
 retention changes) and `cloudlogging-sinks.json` through `StorageFactory`.
