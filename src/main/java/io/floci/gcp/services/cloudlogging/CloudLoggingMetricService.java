@@ -186,7 +186,7 @@ public class CloudLoggingMetricService {
         if (requested.getDescription().length() > 8000) {
             throw GcpException.invalidArgument("The metric description must not exceed 8000 characters");
         }
-        SinkLogEntryFilter.parse(requested.getFilter());
+        LogEntryFilter.parse(requested.getFilter());
         if (!requested.getBucketName().isEmpty()
                 && !requested.getBucketName().startsWith(project + "/locations/")) {
             throw GcpException.invalidArgument("The log bucket must be in the same project as the metric");

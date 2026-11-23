@@ -48,7 +48,7 @@ final class LogMetricRecorder {
     }
 
     void record(String project, String metricName, LogMetric metric, List<StoredLogEntry> entries) {
-        Predicate<StoredLogEntry> matches = SinkLogEntryFilter.parse(metric.getFilter());
+        Predicate<StoredLogEntry> matches = LogEntryFilter.parse(metric.getFilter());
         MetricDescriptor descriptor = metric.getMetricDescriptor();
         boolean distribution = descriptor.getValueType() == MetricDescriptor.ValueType.DISTRIBUTION;
         Map<String, LogMetricExtractor> labelExtractors = new TreeMap<>();

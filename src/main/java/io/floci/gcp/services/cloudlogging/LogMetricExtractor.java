@@ -92,7 +92,7 @@ final class LogMetricExtractor {
 
     private static Function<StoredLogEntry, Object> field(String name, String expression) {
         try {
-            return SinkLogEntryFilter.accessor(name.trim());
+            return LogEntryFilter.accessor(name.trim());
         } catch (GcpException e) {
             throw GcpException.invalidArgument("Unsupported field in extractor: " + expression);
         }

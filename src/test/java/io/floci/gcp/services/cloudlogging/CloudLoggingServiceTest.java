@@ -16,6 +16,7 @@ class CloudLoggingServiceTest {
 
     private static final String PROJECT = "projects/p1";
     private static final String LOG = PROJECT + "/logs/applog";
+    private static final String AUDIT_LOG = PROJECT + "/logs/cloudaudit.googleapis.com%2Factivity";
 
     private CloudLoggingService service;
 
@@ -34,6 +35,10 @@ class CloudLoggingServiceTest {
 
     private void write(StoredLogEntry entry) {
         service.writeLogEntries(null, null, null, null, List.of(entry), false);
+    }
+
+    private List<String> logs(String filter) {
+        return list(filter).stream().map(StoredLogEntry::getLogName).toList();
     }
 
     private List<StoredLogEntry> list(String filter) {
@@ -108,6 +113,62 @@ class CloudLoggingServiceTest {
         assertEquals(1, list("logName = \"" + PROJECT + "/logs/a\"").size());
         assertEquals(1, list("resource.type = \"k8s_container\"").size());
         assertEquals("b", list("resource.type = \"k8s_container\"").get(0).getTextPayload());
+    }
+
+    @Test
+    void listFiltersUseTheQueryLanguageSubsetOfSinks() {
+        StoredLogEntry audit = text(AUDIT_LOG, "NOTICE", null);
+        audit.setTextPayload(null);
+        audit.setProtoPayload(Map.of("@type", "type.googleapis.com/google.cloud.audit.AuditLog",
+                "methodName", "SetIamPolicy", "authenticationInfo", Map.of("principalEmail", "admin@example.com")));
+        service.writeAuditEntries(List.of(audit));
+        StoredLogEntry app = text(LOG, "ERROR", "boom");
+        app.setResourceLabels(Map.of("zone", "us-east1-b"));
+        write(app);
+
+        assertEquals(List.of(AUDIT_LOG), logs("protoPayload.methodName=\"SetIamPolicy\""));
+        assertEquals(List.of(AUDIT_LOG), logs("protoPayload.authenticationInfo.principalEmail:example.com"));
+        assertEquals(List.of(AUDIT_LOG), logs("log_id(\"cloudaudit.googleapis.com/activity\")"));
+        assertEquals(List.of(), logs("log_id(\"cloudaudit.googleapis.com%2Factivity\")"));
+        assertEquals(List.of(AUDIT_LOG), logs("logName:\"cloudaudit.googleapis.com\""));
+        assertEquals(List.of(LOG), logs("NOT logName:\"cloudaudit.googleapis.com\""));
+        assertEquals(List.of(LOG), logs("resource.labels.zone=\"us-east1-b\""));
+        assertEquals(2, list("severity=ERROR OR protoPayload.methodName:Set").size());
+        assertEquals(List.of(), logs("protoPayload.methodName=\"CreateSink\""));
+    }
+
+    @Test
+    void listFiltersRejectWhatTheyCannotEvaluate() {
+        write(text(LOG, "INFO", "x"));
+        for (String filter : List.of("textPayload=~\"x.*\"", "sample(insertId, 0.5)", "severity=ERROR OR",
+                "httpRequest.status=500", "log_name=\"" + LOG + "\"")) {
+            GcpException error = assertThrows(GcpException.class, () -> list(filter), filter);
+            assertEquals("INVALID_ARGUMENT", error.getGcpStatus(), filter);
+        }
+    }
+
+    @Test
+    void pageSizeDefaultsToFiftyAndRejectsNegativeValues() {
+        for (int i = 0; i < 51; i++) {
+            write(text(LOG, "INFO", "entry-" + i));
+        }
+        PageToken.Page<StoredLogEntry> page = service.listLogEntries(List.of(PROJECT), null, null, 0, null);
+        assertEquals(50, page.items().size());
+        assertNotNull(page.nextPageToken());
+        GcpException error = assertThrows(GcpException.class,
+                () -> service.listLogEntries(List.of(PROJECT), null, null, -1, null));
+        assertEquals("INVALID_ARGUMENT", error.getGcpStatus());
+    }
+
+    @Test
+    void entriesWithEqualTimestampsAreOrderedByInsertId() {
+        for (String insertId : List.of("c", "a", "b")) {
+            StoredLogEntry entry = text(LOG, "INFO", insertId);
+            entry.setInsertId(insertId);
+            entry.setTimestamp("2026-11-21T10:00:00Z");
+            write(entry);
+        }
+        assertEquals(List.of("a", "b", "c"), list(null).stream().map(StoredLogEntry::getInsertId).toList());
     }
 
     @Test
