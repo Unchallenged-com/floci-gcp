@@ -352,8 +352,14 @@ single object rather than an array), and the message carries the
 Only entries received after the sink exists are published; nothing is backfilled when a sink is
 created or re-enabled. A missing topic, a denied writer, or a disabled Pub/Sub service is logged,
 does not fail the accepted write, and does not affect other sinks. The failed entries are not
-retried. Real Cloud Logging also writes a `logging.googleapis.com/sink_error` entry and emails the
-project owners for these errors; the emulator does neither.
+retried. For a topic that does not exist, the emulator writes a `logging.googleapis.com/sink_error`
+entry in the sink's project, shaped as the
+[documented example](https://docs.cloud.google.com/logging/docs/export/troubleshoot): a `logging_sink`
+resource (`destination`, `name`, `project_id`), labels `activity_type_name` (`LoggingSinkConfigErrorV2`),
+`destination`, `error_code` (`topic_not_found`), `error_detail` and `sink_id`, severity `ERROR` and the
+text "Cloud Logging sink configuration error in {project}, sink {sink}: topic_not_found ()". One entry is
+written per failed delivery; the entry is stored but not routed again. Other failures (a denied writer, a
+disabled Pub/Sub service) write none, as their error codes are not documented, and no email is sent.
 
 With `iam.authorization-mode=enforce`, grant the `writerIdentity` `roles/pubsub.publisher` on the
 topic or its project. Export checks `pubsub.topics.publish` against that principal. As with Cloud

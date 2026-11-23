@@ -125,12 +125,43 @@ public class CloudLoggingService {
             entryStore.put(key(entry), entry);
         }
         if (sinkService != null) {
-            sinkService.exportEntries(entries);
+            recordSinkErrors(sinkService.exportEntries(entries));
         }
         if (metricService != null) {
             metricService.record(entries);
         }
         LOG.debugf("writeLogEntries stored %d entries", entries.size());
+    }
+
+    /**
+     * Writes one {@code logging.googleapis.com/sink_error} entry per failed delivery, shaped as the documented
+     * example (https://docs.cloud.google.com/logging/docs/export/troubleshoot): a {@code logging_sink} resource, the
+     * {@code LoggingSinkConfigErrorV2} labels, severity ERROR and a text payload naming the error code. They are
+     * stored only, never routed again, so a failing sink cannot feed itself.
+     */
+    private void recordSinkErrors(List<CloudLoggingSinkService.SinkError> errors) {
+        for (CloudLoggingSinkService.SinkError error : errors) {
+            if (!error.parent().startsWith("projects/")) {
+                continue;
+            }
+            String project = error.parent().substring("projects/".length());
+            StoredLogEntry entry = new StoredLogEntry();
+            entry.setLogName(error.parent() + "/logs/logging.googleapis.com%2Fsink_error");
+            entry.setResourceType("logging_sink");
+            entry.setResourceLabels(Map.of("destination", error.destination(), "name", error.sinkId(),
+                    "project_id", project));
+            entry.setLabels(Map.of("activity_type_name", "LoggingSinkConfigErrorV2", "destination", error.destination(),
+                    "error_code", error.errorCode(), "error_detail", "", "sink_id", error.sinkId()));
+            entry.setSeverity("ERROR");
+            entry.setTextPayload("Cloud Logging sink configuration error in " + project + ", sink " + error.sinkId()
+                    + ": " + error.errorCode() + " ()");
+            String now = Instant.now().toString();
+            entry.setInsertId(UUID.randomUUID().toString());
+            entry.setTimestamp(now);
+            entry.setReceiveTimestamp(now);
+            entry.setSequence(sequence.incrementAndGet());
+            entryStore.put(key(entry), entry);
+        }
     }
 
     // ── Read ─────────────────────────────────────────────────────────────────

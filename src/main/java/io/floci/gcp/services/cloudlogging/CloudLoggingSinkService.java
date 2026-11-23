@@ -21,9 +21,11 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 @ApplicationScoped
@@ -189,7 +191,17 @@ public class CloudLoggingSinkService {
         return "serviceAccount:service-" + account + "@gcp-sa-logging.iam.gserviceaccount.com";
     }
 
-    public void exportEntries(List<StoredLogEntry> entries) {
+    /** A delivery a sink could not make, as Cloud Logging reports it in the {@code sink_error} log. */
+    public record SinkError(String parent, String sinkId, String destination, String errorCode) {
+    }
+
+    /**
+     * Routes the entries to every enabled sink. Returns the deliveries that failed for a reason Cloud Logging
+     * names in its {@code sink_error} log: {@code topic_not_found} for a Pub/Sub topic that does not exist, the
+     * code of the documented example (https://docs.cloud.google.com/logging/docs/export/troubleshoot).
+     */
+    public List<SinkError> exportEntries(List<StoredLogEntry> entries) {
+        List<SinkError> errors = new ArrayList<>();
         synchronized (sinkLock) {
             for (String key : sinks.keys().stream().sorted().toList()) {
                 try {
@@ -208,9 +220,24 @@ public class CloudLoggingSinkService {
                 } catch (RuntimeException exception) {
                     // Destination failures must not reject entries already accepted by Logging.
                     LOG.warnf(exception, "Cloud Logging export failed for sink %s", key);
+                    sinkError(key, exception).ifPresent(errors::add);
                 }
             }
         }
+        return errors;
+    }
+
+    private Optional<SinkError> sinkError(String key, RuntimeException exception) {
+        if (!(exception instanceof GcpException failure) || !"NOT_FOUND".equals(failure.getGcpStatus())) {
+            return Optional.empty();
+        }
+        LogSink sink = read(requireSink(key));
+        if (!sink.getDestination().startsWith(CloudLoggingPubSubExporter.DESTINATION_PREFIX)) {
+            return Optional.empty();
+        }
+        String parent = key.substring(0, key.lastIndexOf("/sinks/"));
+        return Optional.of(new SinkError(parent, key.substring(key.lastIndexOf('/') + 1), sink.getDestination(),
+                "topic_not_found"));
     }
 
     private static Timestamp timestamp() {
